@@ -730,45 +730,50 @@ def page_historical() -> None:
     st.write("Open a task to download it, submit predictions, and see its "
              "scores. We hold the answers.")
     _request_section("historical")
+    rows = []
     try:
-        challenge_ids = _bundle_ids("public_bundles")
+        for task_id in _bundle_ids("public_bundles"):
+            rows.append((task_id, "challenge"))
     except Exception as exc:
         st.error(f"Bundle store unavailable: {exc}")
-        challenge_ids = []
-    for task_id in challenge_ids:
+    try:
+        for task_id in _bundle_ids("bundles"):
+            rows.append((task_id, "practice"))
+    except Exception:
+        pass
+    for task_id, kind in sorted(rows):
         try:
-            manifest = _bundle_manifest("public_bundles", task_id)
+            prefix = "public_bundles" if kind == "challenge" else "bundles"
+            manifest = _bundle_manifest(prefix, task_id)
         except Exception:
             manifest = {}
+        mode_pill = (("🏆 competition · answers withheld", "indigo")
+                     if kind == "challenge"
+                     else ("🧪 practice · answers included", "slate"))
         _task_row(task_id, _pretty(task_id, manifest), [
             _lifecycle_pill(task_id),
-            (str(manifest.get("family", "challenge")).replace("_", " "), "teal"),
+            mode_pill,
+            (str(manifest.get("family", "task")).replace("_", " "), "teal"),
             *[(a, "slate") for a in (manifest.get("assets") or [])[:6]],
-            ("answers withheld", "indigo"),
-        ], "challenge")
-    if not challenge_ids:
-        st.info("No challenges yet — request one above.")
-    st.divider()
-    st.subheader("🧪 Practice bundles")
-    st.caption("Answers included — score yourself locally.")
-    try:
-        practice_ids = _bundle_ids("bundles")
-    except Exception:
-        practice_ids = []
-    for task_id in practice_ids:
-        _task_row(task_id, _pretty(task_id),
-                  [("answers included", "slate")], "practice")
-    if not practice_ids:
-        st.caption("No practice bundles yet.")
+        ], kind)
+    if not rows:
+        st.info("No tasks yet — request one above.")
 
 
 def page_leaderboard() -> None:
     st.header("🏆 Leaderboard")
     st.caption("Live and historical never mix — different games. Under 5 "
                "rounds is flagged: one lucky round proves nothing.")
-    for title, subdir in [("🔴 Live", "scores"),
-                          ("🎯 Historical", "historical_scores")]:
+    for title, caption, subdir in [
+        ("🔴 Live challenges",
+         "Scored the moment each deadline resolves against the market.",
+         "scores"),
+        ("🎯 Historical challenges",
+         "Scored server-side against withheld answers.",
+         "historical_scores"),
+    ]:
         st.subheader(title)
+        st.caption(caption)
         try:
             rows = _score_rows(subdir)
         except Exception as exc:
