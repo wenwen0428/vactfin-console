@@ -31,10 +31,15 @@ OPERATORS = {
     "purge_violation": "control leak — train/test windows overlap",
 }
 LIVE_SHAPES = {
-    "single": "One prediction, one deadline",
-    "chain": "Multi-round: submit each round before its deadline",
-    "portfolio": "Paper-trade a portfolio over recent real ticks",
-    "polymarket": "Paper-trade real prediction markets",
+    "single": ("One-shot forecast",
+               "Predict once; scored at one deadline."),
+    "chain": ("Multi-round forecast",
+              "A fresh round every interval — submit before each round's "
+              "deadline; rounds average into your score."),
+    "portfolio": ("Portfolio paper-trading",
+                  "Allocate a paper portfolio over recent real ticks."),
+    "polymarket": ("Prediction-market paper-trading",
+                   "Paper-trade real Polymarket YES/NO markets."),
 }
 
 CSS = """
@@ -395,6 +400,22 @@ def _request_section(kind: str) -> None:
     with st.expander(label):
         st.write("Describe what you want in your own words — that "
                  "description drives the generator.")
+        if kind == "live":
+            live_shape = st.radio(
+                "Challenge shape", list(LIVE_SHAPES),
+                key=f"reqshape_{kind}", horizontal=True,
+                format_func=lambda v: LIVE_SHAPES[v][0],
+                captions=None)
+            st.caption(LIVE_SHAPES[live_shape][1])
+        else:
+            mode = st.radio(
+                "Mode", ["competition", "practice"], key=f"reqmode_{kind}",
+                horizontal=True,
+                format_func=lambda m: ("🏆 Competition — answers withheld; "
+                                       "submit and rank"
+                                       if m == "competition" else
+                                       "🧪 Practice — answers included; "
+                                       "score yourself, no leaderboard"))
         with st.form(f"request_{kind}"):
             request_text = st.text_area(
                 "What kind of task do you want? *",
@@ -449,18 +470,24 @@ def _request_section(kind: str) -> None:
                         format_func=lambda o: f"{o.replace('_', ' ')} — "
                                               f"{OPERATORS[o]}")
                 else:
-                    live_shape = st.radio(
-                        "Challenge shape", list(LIVE_SHAPES),
-                        key=f"reqshape_{kind}",
-                        format_func=lambda v: v.replace("_", " "),
-                        captions=list(LIVE_SHAPES.values()))
-                    c1, c2 = st.columns(2)
-                    rounds = c1.number_input(
-                        "Rounds (multi-round shapes)", 2, 10, 3,
-                        key=f"reqrounds_{kind}")
-                    horizon_seconds = c2.number_input(
-                        "Horizon / round interval (seconds)", 60, 604_800,
-                        3600, key=f"reqhs_{kind}")
+                    rounds = 1
+                    if live_shape in ("chain", "portfolio"):
+                        c1, c2 = st.columns(2)
+                        rounds = c1.number_input(
+                            "Rounds", 2, 10, 3, key=f"reqrounds_{kind}",
+                            help="How many prediction rounds the challenge "
+                                 "runs for.")
+                        horizon_seconds = c2.number_input(
+                            "Round interval (seconds)", 60, 604_800, 3600,
+                            key=f"reqhs_{kind}",
+                            help="Real time between rounds; also each "
+                                 "round's horizon.")
+                    else:
+                        horizon_seconds = st.number_input(
+                            "Horizon (seconds)", 60, 604_800, 3600,
+                            key=f"reqhs_{kind}",
+                            help="How far ahead you are predicting; also "
+                                 "the submission deadline.")
                     live_evidence = st.multiselect(
                         "Evidence", ["charts", "news", "filings"],
                         default=["charts"], key=f"reqev_{kind}",
@@ -499,6 +526,7 @@ def _request_section(kind: str) -> None:
                         payload["modalities"] = modalities
                     if pair_style == "clean + leaky pair":
                         payload["pair_operator"] = pair_operator
+                    payload["mode"] = mode
                 else:
                     payload["live_shape"] = live_shape
                     payload["rounds"] = int(rounds)
