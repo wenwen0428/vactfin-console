@@ -233,11 +233,31 @@ def main() -> None:
             st.error(f"scores unavailable: {exc}")
             score_rows = []
         if score_rows:
-            st.dataframe(
-                [{k: row.get(k) for k in ("task_id", "system_id", "metric_id",
-                                          "score", "metric_orientation")}
-                 for row in score_rows],
-                hide_index=True, width="stretch")
+            by_system: dict[tuple[str, str], list[float]] = {}
+            for row in score_rows:
+                key = (str(row.get("system_id")), str(row.get("metric_id")))
+                by_system.setdefault(key, []).append(float(row.get("score", 0.0)))
+            aggregates = []
+            for (system_id, metric_id), scores in sorted(by_system.items()):
+                n = len(scores)
+                mean = sum(scores) / n
+                std = ((sum((s - mean) ** 2 for s in scores) / (n - 1)) ** 0.5
+                       if n > 1 else None)
+                aggregates.append({
+                    "system_id": system_id, "metric_id": metric_id,
+                    "rounds": n, "mean_score": round(mean, 6),
+                    "score_std": round(std, 6) if std is not None else None,
+                    "sample": "ok" if n >= 5 else "insufficient (<5 rounds)",
+                })
+            st.dataframe(aggregates, hide_index=True, width="stretch")
+            st.caption("One round cannot separate skill from luck; systems "
+                       "under 5 scored rounds are flagged, not ranked.")
+            with st.expander("Raw per-round scores"):
+                st.dataframe(
+                    [{k: row.get(k) for k in ("task_id", "system_id", "metric_id",
+                                              "score", "metric_orientation")}
+                     for row in score_rows],
+                    hide_index=True, width="stretch")
         else:
             st.info("No scores yet.")
 
