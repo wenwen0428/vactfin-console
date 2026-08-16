@@ -64,6 +64,26 @@ def _pretty(task_id: str, manifest: dict | None = None) -> str:
     return " ".join(words)
 
 
+def _seal_api_key(plain: str) -> str:
+    """Seal the guest's key with the operator's X25519 public key.
+
+    Only ciphertext ever reaches storage; the matching private key exists
+    solely on the generation machine. Returns "" when no public key is
+    configured, which the caller treats as "key submission disabled".
+    """
+    try:
+        public_b64 = _cfg("VACTFIN_REQUEST_PUBLIC_KEY")
+    except RuntimeError:
+        return ""
+    import base64
+
+    from nacl.public import PublicKey, SealedBox
+
+    sealed = SealedBox(PublicKey(base64.b64decode(public_b64))).encrypt(
+        plain.encode("utf-8"))
+    return base64.b64encode(sealed).decode("utf-8")
+
+
 def _cfg(name: str) -> str:
     value = os.environ.get(name)
     if value:
@@ -375,12 +395,14 @@ def _request_section(kind: str) -> None:
                 "How hard should it be?", ["easy", "medium", "hard"],
                 value="medium", key=f"reqdiff_{kind}")
             api_key = st.text_input(
-                "Your DeepSeek API key (optional)", type="password",
+                "Your DeepSeek API key *", type="password",
                 key=f"reqkey_{kind}",
-                help="Without a key you draw from a small shared daily "
-                     "quota. Your key is used once for this generation and "
-                     "deleted immediately after — prefer a spending-capped "
-                     "key.")
+                help="Pays for understanding your request (and writing a "
+                     "custom metric if you ask for one) — typically well "
+                     "under $0.01. Encrypted in your browser's request with "
+                     "our public key, decrypted only on the generation "
+                     "machine, and deleted the moment your request is "
+                     "handled. Prefer a spending-capped key.")
             with st.expander("Optional: pin down specifics"):
                 assets_text = st.text_input(
                     "Assets (comma-separated tickers)", "",
@@ -401,16 +423,23 @@ def _request_section(kind: str) -> None:
             submitted = st.form_submit_button("📨 Send request",
                                               type="primary")
         if submitted:
+            sealed_key = _seal_api_key(api_key.strip()) if api_key.strip() else ""
             if not request_text.strip():
                 st.error("Please describe the task — the description is "
                          "required.")
+            elif api_key.strip() and not sealed_key:
+                st.error("Key submission is disabled: the operator has not "
+                         "published an encryption key.")
+            elif not api_key.strip():
+                st.error("Please add your DeepSeek API key — generation "
+                         "runs on your own quota.")
             else:
                 stamp = datetime.now(timezone.utc).isoformat()
                 payload = {
                     "kind": kind,
                     "request_text": request_text.strip(),
                     "difficulty": difficulty,
-                    **({"api_key": api_key.strip()} if api_key.strip() else {}),
+                    "api_key_sealed": sealed_key,
                     "assets": [a.strip().upper()
                                for a in assets_text.split(",") if a.strip()],
                     "status": "pending",
