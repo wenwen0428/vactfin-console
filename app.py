@@ -3,7 +3,8 @@
 Reads the Supabase state mirror (registry, scores, requests) and the R2
 bundle store. All credentials live server-side; the browser never sees a key,
 and submissions are timestamped server-side so the deadline audit cannot be
-gamed. Each task opens as its own sub-page.
+gamed. Each task opens as its own sub-page; requests live at the top of the
+page they belong to.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import zipfile
 from datetime import datetime, timezone
 
@@ -21,6 +23,45 @@ BUCKET = os.environ.get("VACTFIN_BUCKET", "vactfin-artifacts")
 STATE_PREFIX = "state"
 FAMILIES = ["return_forecasting", "volatility_forecasting",
             "cross_sectional_ranking", "portfolio_trading"]
+
+CSS = """
+<style>
+.vf-pills {display:flex;flex-wrap:wrap;gap:.4rem;margin:.15rem 0 .9rem 0;}
+.vf-pill {display:inline-flex;align-items:center;gap:.32rem;
+  padding:.18rem .7rem;border-radius:999px;font-size:.78rem;font-weight:600;
+  letter-spacing:.01em;white-space:nowrap;}
+.vf-indigo {background:rgba(99,102,241,.13);color:#6366F1;
+  border:1px solid rgba(99,102,241,.35);}
+.vf-teal {background:rgba(20,184,166,.13);color:#0D9488;
+  border:1px solid rgba(20,184,166,.35);}
+.vf-amber {background:rgba(245,158,11,.15);color:#B45309;
+  border:1px solid rgba(245,158,11,.4);}
+.vf-slate {background:rgba(100,116,139,.12);color:#64748B;
+  border:1px solid rgba(100,116,139,.3);}
+.vf-rose {background:rgba(244,63,94,.12);color:#E11D48;
+  border:1px solid rgba(244,63,94,.35);}
+.vf-title {font-size:1.02rem;font-weight:700;margin-bottom:.1rem;}
+.vf-sub {font-size:.8rem;opacity:.65;}
+</style>
+"""
+
+
+def _pills(items: list[tuple[str, str]]) -> str:
+    """[(text, tone)] -> one pills row. Tones: indigo/teal/amber/slate/rose."""
+    spans = "".join(
+        f'<span class="vf-pill vf-{tone}">{text}</span>' for text, tone in items)
+    return f'<div class="vf-pills">{spans}</div>'
+
+
+def _pretty(task_id: str, manifest: dict | None = None) -> str:
+    if manifest and manifest.get("title"):
+        return str(manifest["title"])
+    bare = re.sub(r"(_\d{4}){1,2}$", "", task_id)
+    bare = re.sub(r"_\d{8}_\d{6}$", "", bare)
+    tickers = {str(a).lower() for a in (manifest or {}).get("assets") or []}
+    words = [word.upper() if word.lower() in tickers else word.title()
+             for word in bare.replace("__", "_·_").split("_")]
+    return " ".join(words)
 
 
 def _cfg(name: str) -> str:
@@ -161,10 +202,14 @@ def _open_task(kind: str, task_id: str) -> None:
     st.rerun()
 
 
-def _task_row(icon: str, task_id: str, subtitle: str, kind: str) -> None:
+def _task_row(task_id: str, title: str, pills: list[tuple[str, str]],
+              kind: str) -> None:
     with st.container(border=True):
-        left, right = st.columns([5, 1])
-        left.markdown(f"**{icon} {task_id}**  \n{subtitle}")
+        left, right = st.columns([6, 1])
+        with left:
+            st.markdown(f'<div class="vf-title">{title}</div>'
+                        f'<div class="vf-sub">{task_id}</div>'
+                        + _pills(pills), unsafe_allow_html=True)
         if right.button("Open →", key=f"open_{kind}_{task_id}",
                         use_container_width=True):
             _open_task(kind, task_id)
@@ -177,7 +222,7 @@ def _submit_form(task_id: str, key: str) -> None:
         "Your predictions (JSON: row_id → number)", "{}",
         key=f"payload_{key}",
         help="Row ids are inside the task you downloaded.")
-    if st.button("🚀 Submit", key=f"btn_{key}"):
+    if st.button("🚀 Submit", key=f"btn_{key}", type="primary"):
         try:
             submission = json.loads(payload_text)
             assert isinstance(submission, dict) and submission
@@ -217,6 +262,127 @@ def _feedback_form(scope: str, key: str, hint: str) -> None:
             st.success("Got it — this feeds the next generation cycle. 🙏")
 
 
+# ---------- requests (embedded per page) ----------
+
+def _request_section(kind: str) -> None:
+    label = ("✨ Request a new live challenge" if kind == "live"
+             else "✨ Request a new historical challenge")
+    with st.expander(label):
+        st.write("Describe what you want in your own words — that "
+                 "description drives the generator.")
+        with st.form(f"request_{kind}"):
+            request_text = st.text_area(
+                "What kind of task do you want? *",
+                placeholder=("e.g. An hourly forecast on chip stocks with "
+                             "recent news as context."
+                             if kind == "live" else
+                             "e.g. A tough weekly volatility task on big "
+                             "tech, 2024 data."),
+                key=f"reqtext_{kind}")
+            difficulty = st.select_slider(
+                "How hard should it be?", ["easy", "medium", "hard"],
+                value="medium", key=f"reqdiff_{kind}")
+            with st.expander("Optional: pin down specifics"):
+                assets_text = st.text_input(
+                    "Assets (comma-separated tickers)", "",
+                    key=f"reqassets_{kind}")
+                if kind == "historical":
+                    family = st.selectbox(
+                        "Task family",
+                        ["let the generator decide", *FAMILIES],
+                        format_func=lambda f: f.replace("_", " "),
+                        key=f"reqfam_{kind}")
+                    horizon_days = st.number_input(
+                        "Horizon (trading days)", 1, 30, 5,
+                        key=f"reqhd_{kind}")
+                else:
+                    horizon_seconds = st.number_input(
+                        "Horizon (seconds)", 60, 604_800, 3600,
+                        key=f"reqhs_{kind}")
+            submitted = st.form_submit_button("📨 Send request",
+                                              type="primary")
+        if submitted:
+            if not request_text.strip():
+                st.error("Please describe the task — the description is "
+                         "required.")
+            else:
+                stamp = datetime.now(timezone.utc).isoformat()
+                payload = {
+                    "kind": kind,
+                    "request_text": request_text.strip(),
+                    "difficulty": difficulty,
+                    "assets": [a.strip().upper()
+                               for a in assets_text.split(",") if a.strip()],
+                    "status": "pending",
+                    "requested_at": stamp,
+                }
+                if kind == "historical":
+                    if family != "let the generator decide":
+                        payload["family"] = family
+                    payload["horizon_trading_days"] = int(horizon_days)
+                else:
+                    payload["horizon_seconds"] = int(horizon_seconds)
+                _state_put(f"requests/req_{stamp.replace(':', '-')}.json",
+                           payload)
+                st.success("Request received! Track it below.")
+        _request_status_list(kind)
+
+
+def _request_status_list(kind: str) -> None:
+    try:
+        names = _state_list("requests")[-20:]
+        recent = [(name, _state_get(f"requests/{name}")) for name in names]
+    except Exception:
+        return
+    recent = [(n, r) for n, r in recent if r.get("kind") == kind]
+    if not recent:
+        return
+    st.markdown("**Your requests**")
+    tone = {"pending": ("⏳ pending", "slate"),
+            "awaiting_review": ("👀 review me", "amber"),
+            "changes_requested": ("🔁 regenerating", "amber"),
+            "fulfilled": ("✅ ready", "teal"),
+            "rejected": ("❌ rejected", "rose"),
+            "failed": ("❌ failed", "rose")}
+    for name, request in reversed(recent):
+        label, colour = tone.get(str(request.get("status")),
+                                 (str(request.get("status")), "slate"))
+        with st.container(border=True):
+            pills = [(label, colour)]
+            if request.get("difficulty"):
+                pills.append((f"asked: {request['difficulty']}", "indigo"))
+            if request.get("measured_difficulty") is not None:
+                pills.append(
+                    (f"measured: {request['measured_difficulty']:.2f}", "teal"))
+            st.markdown(
+                f'<div class="vf-title">'
+                f'{_pretty(str(request.get("task_id") or "")) or "…"}</div>'
+                f'<div class="vf-sub">'
+                f'{str(request.get("request_text", ""))[:90]}</div>'
+                + _pills(pills), unsafe_allow_html=True)
+            if request.get("reason"):
+                st.caption(f"reason: {request['reason']}")
+            if request.get("status") == "awaiting_review":
+                st.write("The task is generated — open it above, then decide:")
+                approve_col, change_col = st.columns(2)
+                if approve_col.button("✅ Approve", key=f"appr_{name}"):
+                    request["status"] = "fulfilled"
+                    _state_put(f"requests/{name}", request)
+                    st.rerun()
+                change_text = change_col.text_input(
+                    "What should change?", key=f"chg_{name}")
+                if change_col.button("🔁 Request changes",
+                                     key=f"chgbtn_{name}"):
+                    if not change_text.strip():
+                        st.error("Say what should change first.")
+                    else:
+                        request.setdefault("review_feedback", []).append(
+                            change_text.strip())
+                        request["status"] = "changes_requested"
+                        _state_put(f"requests/{name}", request)
+                        st.rerun()
+
+
 # ---------- task detail sub-pages ----------
 
 def detail_live(task_id: str) -> None:
@@ -226,12 +392,16 @@ def detail_live(task_id: str) -> None:
         st.error("Task not found.")
         return
     is_open = row.get("status") == "pending_resolution"
-    st.title(("🟢 " if is_open else "🏁 ") + task_id)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Assets", str(row.get("assets")))
-    c2.metric("Deadline", _time_left(str(row.get("resolve_after", ""))))
-    c3.metric("Scored by", str(row.get("metric_id")))
-    st.caption(f"Deadline (UTC): {row.get('resolve_after')}")
+    st.title(_pretty(task_id))
+    st.markdown(_pills([
+        ("🟢 open" if is_open else "🏁 resolved", "teal" if is_open else "slate"),
+        (f"⏱ {_time_left(str(row.get('resolve_after', '')))}",
+         "amber" if is_open else "slate"),
+        (f"📊 {row.get('metric_id')}", "indigo"),
+        *[(a.strip(), "slate")
+          for a in str(row.get("assets", "")).split(",") if a.strip()],
+    ]), unsafe_allow_html=True)
+    st.caption(f"{task_id} · deadline {row.get('resolve_after')} UTC")
     if is_open:
         st.subheader("📤 Submit your prediction")
         _submit_form(task_id, f"live_{task_id}")
@@ -246,23 +416,31 @@ def detail_live(task_id: str) -> None:
 
 def detail_bundle(task_id: str, *, challenge: bool) -> None:
     prefix = "public_bundles" if challenge else "bundles"
-    st.title(("🎯 " if challenge else "🧪 ") + task_id)
     try:
         manifest = _bundle_manifest(prefix, task_id)
     except Exception as exc:
         st.error(f"could not read bundle: {exc}")
         return
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Type", str(manifest.get("family", "?")).replace("_", " "))
-    c2.metric("Assets", ", ".join(manifest.get("assets") or [])[:24] or "—")
-    c3.metric("Files", len(manifest.get("artifacts") or {}))
-    extras = sorted(manifest.get("evidence") or {})
-    if extras:
-        st.write("Extra evidence: " + ", ".join(f"`{e}`" for e in extras))
+    st.title(_pretty(task_id, manifest))
+    baselines = manifest.get("baselines") or {}
+    pills = [
+        ("🎯 challenge" if challenge else "🧪 practice",
+         "indigo" if challenge else "slate"),
+        (str(manifest.get("family", "?")).replace("_", " "), "teal"),
+        *[(a, "slate") for a in (manifest.get("assets") or [])[:8]],
+        (f"🗂 {len(manifest.get('artifacts') or {})} files", "slate"),
+    ]
+    if baselines.get("difficulty_estimate") is not None:
+        pills.append(
+            (f"difficulty {baselines['difficulty_estimate']:.2f}", "amber"))
+    for extra in sorted(manifest.get("evidence") or {}):
+        pills.append((f"➕ {extra.replace('_', ' ')}", "indigo"))
+    st.markdown(_pills(pills), unsafe_allow_html=True)
+    st.caption(task_id)
     st.download_button(
         "⬇️ Download task", data=_bundle_zip(prefix, task_id),
         file_name=f"{task_id}.zip", mime="application/zip",
-        key=f"dl_{prefix}_{task_id}")
+        key=f"dl_{prefix}_{task_id}", type="primary")
     st.caption("manifest.json lists a sha256 for every file — verify after "
                "download." + ("" if challenge else
                               " Answers are included: score yourself locally."))
@@ -275,6 +453,8 @@ def detail_bundle(task_id: str, *, challenge: bool) -> None:
         except Exception as exc:
             st.error(f"scores unavailable: {exc}")
         st.subheader("💬 Feedback on this task")
+        st.caption("Goes into task memory: it steers this task's revision "
+                   "and future generation.")
         _feedback_form(f"task_{task_id}", f"task_{task_id}",
                        "Anything wrong or confusing about this task?")
 
@@ -285,6 +465,7 @@ def page_live() -> None:
     st.header("🔴 Live challenges")
     st.write("Predict what the market does next — open a task to submit "
              "before its deadline.")
+    _request_section("live")
     try:
         rows = _registry_rows()
     except Exception as exc:
@@ -299,14 +480,19 @@ def page_live() -> None:
     for row in rows:
         task_id = str(row.get("task_id"))
         is_open = row.get("status") == "pending_resolution"
-        _task_row("🟢" if is_open else "🏁", task_id,
-                  f"{row.get('assets')} · "
-                  f"{_time_left(str(row.get('resolve_after', '')))}",
-                  "live")
+        _task_row(task_id, _pretty(task_id), [
+            ("🟢 open" if is_open else "🏁 resolved",
+             "teal" if is_open else "slate"),
+            (f"⏱ {_time_left(str(row.get('resolve_after', '')))}",
+             "amber" if is_open else "slate"),
+            *[(a.strip(), "slate")
+              for a in str(row.get("assets", "")).split(",") if a.strip()],
+        ], "live")
     if not rows:
-        st.info("Nothing live right now — ask for one on the 📝 Request page.")
+        st.info("Nothing live right now — request one above.")
     st.divider()
     st.subheader("💬 Shape the next live tasks")
+    st.caption("Goes into task memory and steers upcoming live generation.")
     _feedback_form("live_feedback", "live_page",
                    "What should the next live tasks look like? "
                    "(assets, horizons, data you want)")
@@ -316,15 +502,24 @@ def page_historical() -> None:
     st.header("🎯 Historical challenges")
     st.write("Open a task to download it, submit predictions, and see its "
              "scores. We hold the answers.")
+    _request_section("historical")
     try:
         challenge_ids = _bundle_ids("public_bundles")
     except Exception as exc:
         st.error(f"Bundle store unavailable: {exc}")
         challenge_ids = []
     for task_id in challenge_ids:
-        _task_row("🎯", task_id, "challenge · answers withheld", "challenge")
+        try:
+            manifest = _bundle_manifest("public_bundles", task_id)
+        except Exception:
+            manifest = {}
+        _task_row(task_id, _pretty(task_id, manifest), [
+            (str(manifest.get("family", "challenge")).replace("_", " "), "teal"),
+            *[(a, "slate") for a in (manifest.get("assets") or [])[:6]],
+            ("answers withheld", "indigo"),
+        ], "challenge")
     if not challenge_ids:
-        st.info("No challenges yet — ask for one on the 📝 Request page.")
+        st.info("No challenges yet — request one above.")
     st.divider()
     st.subheader("🧪 Practice bundles")
     st.caption("Answers included — score yourself locally.")
@@ -333,108 +528,10 @@ def page_historical() -> None:
     except Exception:
         practice_ids = []
     for task_id in practice_ids:
-        _task_row("🧪", task_id, "practice · answers included", "practice")
+        _task_row(task_id, _pretty(task_id),
+                  [("answers included", "slate")], "practice")
     if not practice_ids:
         st.caption("No practice bundles yet.")
-
-
-def page_request() -> None:
-    st.header("📝 Request a task")
-    st.write("Describe what you want in your own words — that description "
-             "drives the generator. The structured fields are optional "
-             "nudges.")
-    with st.form("request"):
-        request_text = st.text_area(
-            "What kind of task do you want? *",
-            placeholder=("e.g. A tough weekly volatility forecasting task on "
-                         "big tech, with news headlines as extra evidence."),
-            help="Required — this is the main input to the generator.")
-        difficulty = st.select_slider(
-            "How hard should it be?",
-            ["easy", "medium", "hard"], value="medium")
-        kind = st.radio("Task type", ["historical", "live"], horizontal=True)
-        with st.expander("Optional: pin down specifics"):
-            family = st.selectbox("Task family", ["let the generator decide",
-                                                  *FAMILIES],
-                                  format_func=lambda f: f.replace("_", " "))
-            assets_text = st.text_input("Assets (comma-separated tickers)", "")
-            c1, c2 = st.columns(2)
-            horizon_days = c1.number_input(
-                "Horizon (trading days, historical)", 1, 30, 5)
-            horizon_seconds = c2.number_input(
-                "Horizon (seconds, live)", 60, 604_800, 3600)
-        submitted = st.form_submit_button("📨 Send request")
-    if submitted:
-        if not request_text.strip():
-            st.error("Please describe the task — the description is required.")
-        else:
-            stamp = datetime.now(timezone.utc).isoformat()
-            payload = {
-                "kind": kind,
-                "request_text": request_text.strip(),
-                "difficulty": difficulty,
-                "assets": [a.strip().upper() for a in assets_text.split(",")
-                           if a.strip()],
-                "horizon_trading_days": int(horizon_days),
-                "horizon_seconds": int(horizon_seconds),
-                "status": "pending",
-                "requested_at": stamp,
-            }
-            if family != "let the generator decide":
-                payload["family"] = family
-            _state_put(f"requests/req_{stamp.replace(':', '-')}.json", payload)
-            st.success("Request received! Generation usually lands within a "
-                       "day — track it below.")
-
-    st.subheader("Your requests")
-    try:
-        names = _state_list("requests")[-15:]
-        recent = [(name, _state_get(f"requests/{name}")) for name in names]
-    except Exception:
-        recent = []
-    status_icon = {"pending": "⏳ pending", "awaiting_review": "👀 review me",
-                   "changes_requested": "🔁 regenerating",
-                   "fulfilled": "✅ ready", "rejected": "❌ rejected",
-                   "failed": "❌ failed"}
-    for name, request in reversed(recent):
-        label = status_icon.get(str(request.get("status")),
-                                str(request.get("status")))
-        with st.container(border=True):
-            st.markdown(
-                f"**{label}** · {request.get('kind')} · "
-                f"_{str(request.get('request_text', ''))[:80]}_")
-            detail_bits = []
-            if request.get("task_id"):
-                detail_bits.append(f"task: `{request['task_id']}`")
-            if request.get("measured_difficulty") is not None:
-                detail_bits.append(
-                    f"measured difficulty: {request['measured_difficulty']:.2f} "
-                    f"(asked: {request.get('difficulty', '—')})")
-            if request.get("reason"):
-                detail_bits.append(f"reason: {request['reason']}")
-            if detail_bits:
-                st.caption(" · ".join(detail_bits))
-            if request.get("status") == "awaiting_review":
-                st.write("The task is generated — check it on the "
-                         "🎯 Historical page, then decide:")
-                approve_col, change_col = st.columns(2)
-                if approve_col.button("✅ Approve", key=f"appr_{name}"):
-                    request["status"] = "fulfilled"
-                    _state_put(f"requests/{name}", request)
-                    st.rerun()
-                change_text = change_col.text_input(
-                    "What should change?", key=f"chg_{name}")
-                if change_col.button("🔁 Request changes", key=f"chgbtn_{name}"):
-                    if not change_text.strip():
-                        st.error("Say what should change first.")
-                    else:
-                        request.setdefault("review_feedback", []).append(
-                            change_text.strip())
-                        request["status"] = "changes_requested"
-                        _state_put(f"requests/{name}", request)
-                        st.rerun()
-    if not recent:
-        st.caption("No requests yet — yours could be the first.")
 
 
 def page_leaderboard() -> None:
@@ -470,7 +567,6 @@ def page_feedback() -> None:
 PAGES = {
     "🔴 Live challenges": page_live,
     "🎯 Historical challenges": page_historical,
-    "📝 Request a task": page_request,
     "🏆 Leaderboard": page_leaderboard,
     "💬 Feedback": page_feedback,
 }
@@ -478,6 +574,7 @@ PAGES = {
 
 def main() -> None:
     st.set_page_config(page_title="VACT-Fin", page_icon="📈", layout="wide")
+    st.markdown(CSS, unsafe_allow_html=True)
     with st.sidebar:
         st.title("📈 VACT-Fin")
         st.caption("Market prediction challenges, scored fairly and on time.")
