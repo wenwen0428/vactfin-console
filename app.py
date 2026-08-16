@@ -1,10 +1,9 @@
-"""VACT-Fin public console — self-contained Streamlit app for HF Spaces.
+"""VACT-Fin public console — self-contained Streamlit app.
 
 Reads the Supabase state mirror (registry, scores) and the R2 bundle store.
-Guests browse tasks, download verified bundles, submit predictions before a
-live task's resolve time, and leave feedback. All credentials live in Space
-secrets server-side; the browser never sees a key, and submissions are
-timestamped server-side so the punctuality audit cannot be gamed.
+All credentials live server-side (Streamlit secrets / env); the browser never
+sees a key, and submissions are timestamped server-side so the deadline audit
+cannot be gamed.
 """
 
 from __future__ import annotations
@@ -20,11 +19,9 @@ import streamlit as st
 
 BUCKET = os.environ.get("VACTFIN_BUCKET", "vactfin-artifacts")
 STATE_PREFIX = "state"
-BUNDLE_PREFIX = "bundles"
 
 
 def _cfg(name: str) -> str:
-    """Secrets come from env vars (HF Spaces) or st.secrets (Streamlit Cloud)."""
     value = os.environ.get(name)
     if value:
         return value
@@ -84,32 +81,31 @@ def _r2():
 
 
 @st.cache_data(ttl=300)
-def _bundle_ids() -> list[str]:
+def _bundle_ids(prefix: str) -> list[str]:
     paginator = _r2().get_paginator("list_objects_v2")
     ids = set()
-    for page in paginator.paginate(Bucket=BUCKET, Prefix=f"{BUNDLE_PREFIX}/",
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=f"{prefix}/",
                                    Delimiter="/"):
-        for prefix in page.get("CommonPrefixes") or []:
-            ids.add(prefix["Prefix"].split("/")[1])
+        for common in page.get("CommonPrefixes") or []:
+            ids.add(common["Prefix"].split("/")[1])
     return sorted(ids)
 
 
 @st.cache_data(ttl=300)
-def _bundle_manifest(task_id: str) -> dict:
-    obj = _r2().get_object(
-        Bucket=BUCKET, Key=f"{BUNDLE_PREFIX}/{task_id}/manifest.json")
+def _bundle_manifest(prefix: str, task_id: str) -> dict:
+    obj = _r2().get_object(Bucket=BUCKET, Key=f"{prefix}/{task_id}/manifest.json")
     return json.loads(obj["Body"].read())
 
 
-def _bundle_zip(task_id: str) -> bytes:
+def _bundle_zip(prefix: str, task_id: str) -> bytes:
     client = _r2()
     buffer = io.BytesIO()
     paginator = client.get_paginator("list_objects_v2")
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for page in paginator.paginate(Bucket=BUCKET,
-                                       Prefix=f"{BUNDLE_PREFIX}/{task_id}/"):
+                                       Prefix=f"{prefix}/{task_id}/"):
             for obj in page.get("Contents") or []:
-                relative = obj["Key"].removeprefix(f"{BUNDLE_PREFIX}/{task_id}/")
+                relative = obj["Key"].removeprefix(f"{prefix}/{task_id}/")
                 body = client.get_object(Bucket=BUCKET, Key=obj["Key"])["Body"].read()
                 archive.writestr(f"{task_id}/{relative}", body)
     return buffer.getvalue()
@@ -119,163 +115,249 @@ def _registry_rows() -> list[dict]:
     return [_state_get(f"registry/{name}") for name in _state_list("registry")]
 
 
-def main() -> None:
-    st.set_page_config(page_title="VACT-Fin", page_icon="V", layout="wide")
-    st.title("VACT-Fin — point-in-time-correct financial tasks")
-    st.caption(
-        "Generated, verified task bundles with measurable leakage inflation. "
-        "Live tasks resolve on a clock; submissions after resolution are "
-        "refused by the scoring audit.")
+def _score_rows(subdir: str) -> list[dict]:
+    return [_state_get(f"{subdir}/{name}") for name in _state_list(subdir)]
 
-    tabs = st.tabs(["Live Tasks", "Historical Bundles", "Submit", "Leaderboard",
-                    "Feedback"])
 
-    with tabs[0]:
-        st.subheader("Live task registry")
+def _aggregate(rows: list[dict]) -> list[dict]:
+    by_system: dict[tuple[str, str], list[float]] = {}
+    for row in rows:
+        key = (str(row.get("system_id")), str(row.get("metric_id")))
+        by_system.setdefault(key, []).append(float(row.get("score", 0.0)))
+    out = []
+    for (system_id, metric_id), scores in sorted(by_system.items()):
+        n = len(scores)
+        mean = sum(scores) / n
+        std = ((sum((s - mean) ** 2 for s in scores) / (n - 1)) ** 0.5
+               if n > 1 else None)
+        out.append({
+            "system": system_id, "metric": metric_id, "rounds": n,
+            "avg score": round(mean, 6),
+            "spread": round(std, 6) if std is not None else None,
+            "sample": "✅ ok" if n >= 5 else "⚠️ <5 rounds",
+        })
+    return out
+
+
+def _time_left(resolve_after: str) -> str:
+    try:
+        deadline = datetime.fromisoformat(resolve_after)
+    except ValueError:
+        return "—"
+    delta = deadline - datetime.now(timezone.utc)
+    seconds = int(delta.total_seconds())
+    if seconds <= 0:
+        return "closed"
+    if seconds < 3600:
+        return f"{seconds // 60}m left"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m left"
+    return f"{seconds // 86400}d {(seconds % 86400) // 3600}h left"
+
+
+def _submit_form(pending: list[str], kind: str) -> None:
+    task_id = st.selectbox("Pick a task", pending, key=f"task_{kind}")
+    system_id = st.text_input("Your team / model name", "my_model",
+                              key=f"system_{kind}")
+    payload_text = st.text_area(
+        "Your predictions (JSON: row_id → number)",
+        "{}", key=f"payload_{kind}",
+        help="Row ids are inside the task you downloaded.")
+    if st.button("🚀 Submit", key=f"btn_{kind}"):
         try:
-            rows = _registry_rows()
+            submission = json.loads(payload_text)
+            assert isinstance(submission, dict) and submission
+        except Exception:
+            st.error("Predictions must be a non-empty JSON object.")
+            return
+        stamped = {
+            "task_id": task_id,
+            "system_id": system_id.strip() or "anonymous",
+            "submission": submission,
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _state_put(f"submissions/{task_id}__{stamped['system_id']}.json", stamped)
+        st.success(f"Locked in at {stamped['submitted_at'][:19]} UTC. "
+                   "Scores appear on the leaderboard after resolution.")
+        st.balloons()
+
+
+def page_live() -> None:
+    st.header("🔴 Live challenges")
+    st.write("Predict what the market does next. Each task has a real "
+             "deadline — submit before it resolves.")
+    try:
+        rows = _registry_rows()
+    except Exception as exc:
+        st.error(f"Registry unavailable: {exc}")
+        return
+    pending = [r for r in rows if r.get("status") == "pending_resolution"]
+    resolved = [r for r in rows if r.get("status") == "resolved"]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Open now", len(pending))
+    c2.metric("Resolved", len(resolved))
+    next_deadline = min((r.get("resolve_after", "") for r in pending),
+                        default="")
+    c3.metric("Next deadline", _time_left(next_deadline) if next_deadline else "—")
+    if not rows:
+        st.info("Nothing live right now — check back soon.")
+        return
+    st.dataframe(
+        [{"task": r.get("task_id"), "assets": r.get("assets"),
+          "status": "🟢 open" if r in pending else "🏁 resolved",
+          "deadline": _time_left(str(r.get("resolve_after", ""))),
+          "scored by": r.get("metric_id")}
+         for r in rows],
+        hide_index=True, width="stretch")
+
+
+def page_library() -> None:
+    st.header("📚 Task library")
+    st.write("Download a task, work on it locally, and (for challenge "
+             "bundles) send us your predictions.")
+
+    st.subheader("🎯 Challenge bundles")
+    st.caption("Answers withheld — submit your predictions and we score them.")
+    try:
+        challenge_ids = _bundle_ids("public_bundles")
+    except Exception as exc:
+        st.error(f"Bundle store unavailable: {exc}")
+        challenge_ids = []
+    if not challenge_ids:
+        st.info("No challenge bundles yet.")
+    for task_id in challenge_ids:
+        _bundle_card("public_bundles", task_id)
+
+    st.subheader("🧪 Practice bundles")
+    st.caption("Answers included — score yourself locally, no submission.")
+    try:
+        practice_ids = _bundle_ids("bundles")
+    except Exception:
+        practice_ids = []
+    if not practice_ids:
+        st.info("No practice bundles yet.")
+    for task_id in practice_ids:
+        _bundle_card("bundles", task_id)
+
+
+def _bundle_card(prefix: str, task_id: str) -> None:
+    with st.expander(f"📦 {task_id}"):
+        try:
+            manifest = _bundle_manifest(prefix, task_id)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Type", str(manifest.get("family", "?")).replace("_", " "))
+            c2.metric("Assets", ", ".join(manifest.get("assets") or [])[:24] or "—")
+            c3.metric("Files", len(manifest.get("artifacts") or {}))
+            extras = sorted(manifest.get("evidence") or {})
+            if extras:
+                st.write("Extra evidence: " + ", ".join(f"`{e}`" for e in extras))
+            st.download_button(
+                "⬇️ Download",
+                data=_bundle_zip(prefix, task_id),
+                file_name=f"{task_id}.zip",
+                mime="application/zip",
+                key=f"dl_{prefix}_{task_id}",
+            )
+            st.caption("manifest.json lists a sha256 for every file — "
+                       "verify after download.")
         except Exception as exc:
-            st.error(f"registry unavailable: {exc}")
-            rows = []
-        if rows:
-            now = datetime.now(timezone.utc).isoformat()
-            for row in rows:
-                row["submission_open"] = (
-                    row.get("status") == "pending_resolution"
-                    and str(row.get("resolve_after", "")) > now)
-            st.dataframe(
-                [{k: row.get(k) for k in ("task_id", "status", "assets",
-                                          "resolve_after", "submission_open",
-                                          "metric_id")}
-                 for row in rows],
-                hide_index=True, width="stretch")
-            st.caption("submission_open = you can still submit; scoring "
-                       "refuses anything stamped after resolution.")
-        else:
-            st.info("No live tasks mirrored yet.")
+            st.error(f"could not read bundle: {exc}")
 
-    with tabs[1]:
-        st.subheader("Verified bundles (download and run locally)")
-        try:
-            ids = _bundle_ids()
-        except Exception as exc:
-            st.error(f"bundle store unavailable: {exc}")
-            ids = []
-        if not ids:
-            st.info("No bundles published yet.")
-        for task_id in ids:
-            with st.expander(task_id):
-                try:
-                    manifest = _bundle_manifest(task_id)
-                    st.write({
-                        "task_class": manifest.get("task_class"),
-                        "family": manifest.get("family"),
-                        "assets": manifest.get("assets"),
-                        "status": manifest.get("status"),
-                        "artifacts": len(manifest.get("artifacts") or {}),
-                        "evidence": sorted(manifest.get("evidence") or {}),
-                    })
-                    st.download_button(
-                        f"Download {task_id}.zip",
-                        data=_bundle_zip(task_id),
-                        file_name=f"{task_id}.zip",
-                        mime="application/zip",
-                        key=f"dl_{task_id}",
-                    )
-                    st.caption("Every file is listed with its sha256 in "
-                               "manifest.json — verify after download.")
-                except Exception as exc:
-                    st.error(f"could not read bundle: {exc}")
 
-    with tabs[2]:
-        st.subheader("Submit predictions for a pending live task")
+def page_submit() -> None:
+    st.header("📤 Submit predictions")
+    kind = st.radio("What are you submitting for?",
+                    ["🔴 Live challenge", "🎯 Historical challenge"],
+                    horizontal=True)
+    if kind.startswith("🔴"):
         try:
-            pending = [row["task_id"] for row in _registry_rows()
-                       if row.get("status") == "pending_resolution"]
+            pending = [r["task_id"] for r in _registry_rows()
+                       if r.get("status") == "pending_resolution"]
         except Exception:
             pending = []
         if not pending:
-            st.info("No pending live tasks right now.")
-        else:
-            task_id = st.selectbox("Task", pending)
-            system_id = st.text_input("Your system id", "guest_system")
-            payload_text = st.text_area(
-                "Predictions JSON (row_id -> number)",
-                '{"AAPL_...": 0.0}',
-                help="Row ids are listed in the bundle's live_observations.json.")
-            if st.button("Submit"):
-                try:
-                    submission = json.loads(payload_text)
-                    assert isinstance(submission, dict) and submission
-                except Exception:
-                    st.error("Predictions must be a non-empty JSON object.")
-                else:
-                    stamped = {
-                        "task_id": task_id,
-                        "system_id": system_id.strip() or "guest_system",
-                        "submission": submission,
-                        "submitted_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    _state_put(
-                        f"submissions/{task_id}__{stamped['system_id']}.json",
-                        stamped)
-                    st.success(
-                        f"Submitted at {stamped['submitted_at']}. Scoring "
-                        "happens at resolution; check the leaderboard after "
-                        "the task's resolve time.")
-
-    with tabs[3]:
-        st.subheader("Leaderboard (live-resolved scores)")
+            st.info("No open live tasks right now.")
+            return
+        st.caption("Live tasks are scored the moment they resolve. "
+                   "Late submissions are refused automatically.")
+        _submit_form(pending, "live")
+    else:
         try:
-            score_rows = [_state_get(f"scores/{name}")
-                          for name in _state_list("scores")]
+            challenge_ids = _bundle_ids("public_bundles")
+        except Exception:
+            challenge_ids = []
+        if not challenge_ids:
+            st.info("No historical challenges published yet.")
+            return
+        st.caption("We keep the answers; your predictions are scored "
+                   "server-side, usually within a day.")
+        _submit_form(challenge_ids, "historical")
+
+
+def page_leaderboard() -> None:
+    st.header("🏆 Leaderboard")
+    st.caption("Live and historical results never mix — they are different "
+               "games. Under 5 rounds is flagged: one lucky round proves "
+               "nothing.")
+    for title, subdir in [("🔴 Live", "scores"),
+                          ("🎯 Historical", "historical_scores")]:
+        st.subheader(title)
+        try:
+            rows = _score_rows(subdir)
         except Exception as exc:
             st.error(f"scores unavailable: {exc}")
-            score_rows = []
-        if score_rows:
-            by_system: dict[tuple[str, str], list[float]] = {}
-            for row in score_rows:
-                key = (str(row.get("system_id")), str(row.get("metric_id")))
-                by_system.setdefault(key, []).append(float(row.get("score", 0.0)))
-            aggregates = []
-            for (system_id, metric_id), scores in sorted(by_system.items()):
-                n = len(scores)
-                mean = sum(scores) / n
-                std = ((sum((s - mean) ** 2 for s in scores) / (n - 1)) ** 0.5
-                       if n > 1 else None)
-                aggregates.append({
-                    "system_id": system_id, "metric_id": metric_id,
-                    "rounds": n, "mean_score": round(mean, 6),
-                    "score_std": round(std, 6) if std is not None else None,
-                    "sample": "ok" if n >= 5 else "insufficient (<5 rounds)",
-                })
-            st.dataframe(aggregates, hide_index=True, width="stretch")
-            st.caption("One round cannot separate skill from luck; systems "
-                       "under 5 scored rounds are flagged, not ranked.")
-            with st.expander("Raw per-round scores"):
-                st.dataframe(
-                    [{k: row.get(k) for k in ("task_id", "system_id", "metric_id",
-                                              "score", "metric_orientation")}
-                     for row in score_rows],
-                    hide_index=True, width="stretch")
-        else:
-            st.info("No scores yet.")
+            continue
+        if not rows:
+            st.info("No scores here yet — be the first.")
+            continue
+        st.dataframe(_aggregate(rows), hide_index=True, width="stretch")
+        with st.expander("Every scored round"):
+            st.dataframe(
+                [{k: row.get(k) for k in ("task_id", "system_id", "metric_id",
+                                          "score")}
+                 for row in rows],
+                hide_index=True, width="stretch")
 
-    with tabs[4]:
-        st.subheader("Feedback")
-        kind = st.selectbox("About", ["task_quality", "bug", "request"])
-        text = st.text_area("What should we know?")
-        contact = st.text_input("Contact (optional)")
-        if st.button("Send feedback"):
-            if not text.strip():
-                st.error("Feedback text is empty.")
-            else:
-                stamp = datetime.now(timezone.utc).isoformat()
-                _state_put(
-                    f"feedback/{kind}_{stamp.replace(':', '-')}.json",
-                    {"kind": kind, "text": text.strip(),
-                     "contact": contact.strip(), "recorded_at": stamp})
-                st.success("Recorded — thank you.")
+
+def page_feedback() -> None:
+    st.header("💬 Tell us what to fix")
+    st.write("Bad task? Confusing data? Want a new market or task type? "
+             "This goes straight into the next generation cycle.")
+    kind = st.selectbox("Topic", ["a task felt wrong", "bug", "feature request",
+                                  "something else"])
+    text = st.text_area("Details")
+    contact = st.text_input("Contact (optional)")
+    if st.button("Send"):
+        if not text.strip():
+            st.error("Please write something first.")
+        else:
+            stamp = datetime.now(timezone.utc).isoformat()
+            _state_put(
+                f"feedback/{kind.replace(' ', '_')}_{stamp.replace(':', '-')}.json",
+                {"kind": kind, "text": text.strip(),
+                 "contact": contact.strip(), "recorded_at": stamp})
+            st.success("Got it — thank you! 🙏")
+
+
+PAGES = {
+    "🔴 Live challenges": page_live,
+    "📚 Task library": page_library,
+    "📤 Submit": page_submit,
+    "🏆 Leaderboard": page_leaderboard,
+    "💬 Feedback": page_feedback,
+}
+
+
+def main() -> None:
+    st.set_page_config(page_title="VACT-Fin", page_icon="📈", layout="wide")
+    with st.sidebar:
+        st.title("📈 VACT-Fin")
+        st.caption("Market prediction challenges, scored fairly and on time.")
+        choice = st.radio("Navigate", list(PAGES), label_visibility="collapsed")
+        st.divider()
+        st.caption("How it works: grab a task → predict → submit before the "
+                   "deadline → see your score.")
+    PAGES[choice]()
 
 
 main()
