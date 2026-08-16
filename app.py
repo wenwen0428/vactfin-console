@@ -23,6 +23,19 @@ BUCKET = os.environ.get("VACTFIN_BUCKET", "vactfin-artifacts")
 STATE_PREFIX = "state"
 FAMILIES = ["return_forecasting", "volatility_forecasting",
             "cross_sectional_ranking", "portfolio_trading"]
+HIST_MODALITIES = ["chart", "news", "news_article", "filing_text",
+                   "filing_table", "macro"]
+OPERATORS = {
+    "future_direction_hint": "realistic leak — a subtle hint of the future",
+    "label_as_feature": "control leak — the answer hidden in a column",
+    "purge_violation": "control leak — train/test windows overlap",
+}
+LIVE_SHAPES = {
+    "single": "One prediction, one deadline",
+    "chain": "Multi-round: submit each round before its deadline",
+    "portfolio": "Paper-trade a portfolio over recent real ticks",
+    "polymarket": "Paper-trade real prediction markets",
+}
 
 CSS = """
 <style>
@@ -392,8 +405,10 @@ def _request_section(kind: str) -> None:
                              "tech, 2024 data."),
                 key=f"reqtext_{kind}")
             difficulty = st.select_slider(
-                "How hard should it be?", ["easy", "medium", "hard"],
-                value="medium", key=f"reqdiff_{kind}")
+                "How hard should it be?",
+                ["auto", "easy", "medium", "hard"], value="auto",
+                key=f"reqdiff_{kind}",
+                help="auto = we read it from your words.")
             api_key = st.text_input(
                 "Your DeepSeek API key *", type="password",
                 key=f"reqkey_{kind}",
@@ -416,10 +431,41 @@ def _request_section(kind: str) -> None:
                     horizon_days = st.number_input(
                         "Horizon (trading days)", 1, 30, 5,
                         key=f"reqhd_{kind}")
+                    modalities = st.multiselect(
+                        "Extra evidence", HIST_MODALITIES,
+                        key=f"reqmod_{kind}",
+                        format_func=lambda m: m.replace("_", " "),
+                        help="Charts, headlines, SEC filings/tables, macro — "
+                             "on top of daily prices.")
+                    pair_style = st.radio(
+                        "Task style", ["clean", "clean + leaky pair"],
+                        key=f"reqpair_{kind}", horizontal=True,
+                        help="A pair adds a twin with one planted leak: "
+                             "submit to both and your score gap measures "
+                             "how much the leak inflates you.")
+                    pair_operator = st.selectbox(
+                        "Leak type (pair only)", list(OPERATORS),
+                        key=f"reqop_{kind}",
+                        format_func=lambda o: f"{o.replace('_', ' ')} — "
+                                              f"{OPERATORS[o]}")
                 else:
-                    horizon_seconds = st.number_input(
-                        "Horizon (seconds)", 60, 604_800, 3600,
-                        key=f"reqhs_{kind}")
+                    live_shape = st.radio(
+                        "Challenge shape", list(LIVE_SHAPES),
+                        key=f"reqshape_{kind}",
+                        format_func=lambda v: v.replace("_", " "),
+                        captions=list(LIVE_SHAPES.values()))
+                    c1, c2 = st.columns(2)
+                    rounds = c1.number_input(
+                        "Rounds (multi-round shapes)", 2, 10, 3,
+                        key=f"reqrounds_{kind}")
+                    horizon_seconds = c2.number_input(
+                        "Horizon / round interval (seconds)", 60, 604_800,
+                        3600, key=f"reqhs_{kind}")
+                    live_evidence = st.multiselect(
+                        "Evidence", ["charts", "news", "filings"],
+                        default=["charts"], key=f"reqev_{kind}",
+                        help="What the solver sees besides the quote: tick "
+                             "charts, fresh headlines, recent SEC filings.")
             submitted = st.form_submit_button("📨 Send request",
                                               type="primary")
         if submitted:
@@ -449,8 +495,15 @@ def _request_section(kind: str) -> None:
                     if family != "let the generator decide":
                         payload["family"] = family
                     payload["horizon_trading_days"] = int(horizon_days)
+                    if modalities:
+                        payload["modalities"] = modalities
+                    if pair_style == "clean + leaky pair":
+                        payload["pair_operator"] = pair_operator
                 else:
+                    payload["live_shape"] = live_shape
+                    payload["rounds"] = int(rounds)
                     payload["horizon_seconds"] = int(horizon_seconds)
+                    payload["evidence"] = live_evidence
                 _state_put(f"requests/req_{stamp.replace(':', '-')}.json",
                            payload)
                 st.success("Request received! Track it below.")
