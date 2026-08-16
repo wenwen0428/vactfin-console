@@ -135,6 +135,18 @@ def _bundle_ids(prefix: str) -> list[str]:
 
 
 @st.cache_data(ttl=300)
+def _dataset_row_ids(prefix: str, task_id: str) -> list[str]:
+    try:
+        obj = _r2().get_object(
+            Bucket=BUCKET,
+            Key=f"{prefix}/{task_id}/environment/data/dataset.json")
+        dataset = json.loads(obj["Body"].read())
+        return [str(row.get("row_id")) for row in dataset.get("test") or []]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300)
 def _bundle_manifest(prefix: str, task_id: str) -> dict:
     obj = _r2().get_object(Bucket=BUCKET, Key=f"{prefix}/{task_id}/manifest.json")
     return json.loads(obj["Body"].read())
@@ -152,6 +164,43 @@ def _bundle_zip(prefix: str, task_id: str) -> bytes:
                 body = client.get_object(Bucket=BUCKET, Key=obj["Key"])["Body"].read()
                 archive.writestr(f"{task_id}/{relative}", body)
     return buffer.getvalue()
+
+
+@st.cache_data(ttl=60)
+def _task_lifecycle() -> dict[str, str]:
+    """task_id -> lifecycle, derived from requests. Absent = operator-published."""
+    try:
+        names = _state_list("requests")
+    except Exception:
+        return {}
+    lifecycle = {}
+    for name in names:
+        try:
+            request = _state_get(f"requests/{name}")
+        except Exception:
+            continue
+        task_id = str(request.get("task_id") or "")
+        if not task_id:
+            continue
+        lifecycle[task_id] = {
+            "pending": "generating",
+            "changes_requested": "improving",
+            "awaiting_review": "pending review",
+            "fulfilled": "approved",
+            "rejected": "failed",
+            "failed": "failed",
+        }.get(str(request.get("status")), "approved")
+    return lifecycle
+
+
+LIFECYCLE_TONE = {"generating": "slate", "improving": "amber",
+                  "pending review": "amber", "approved": "teal",
+                  "failed": "rose"}
+
+
+def _lifecycle_pill(task_id: str) -> tuple[str, str]:
+    state = _task_lifecycle().get(task_id, "approved")
+    return (state, LIFECYCLE_TONE.get(state, "slate"))
 
 
 def _registry_rows() -> list[dict]:
@@ -215,20 +264,62 @@ def _task_row(task_id: str, title: str, pills: list[tuple[str, str]],
             _open_task(kind, task_id)
 
 
-def _submit_form(task_id: str, key: str) -> None:
+def _parse_submission(uploaded, payload_text: str) -> tuple[dict | None, str]:
+    """Uploaded .json/.csv wins over the pasted text. Returns (data, error)."""
+    if uploaded is not None:
+        raw = uploaded.getvalue().decode("utf-8", errors="replace")
+        if uploaded.name.lower().endswith(".csv"):
+            rows = [line.split(",") for line in raw.strip().splitlines()
+                    if line.strip()]
+            if rows and rows[0][0].strip().lower() in ("row_id", "id"):
+                rows = rows[1:]
+            try:
+                return ({cell[0].strip(): float(cell[1])
+                         for cell in rows if len(cell) >= 2}, "")
+            except ValueError:
+                return None, "CSV rows must be `row_id,number`."
+        try:
+            data = json.loads(raw)
+            assert isinstance(data, dict) and data
+            return data, ""
+        except Exception:
+            return None, "The uploaded JSON must be a non-empty object."
+    try:
+        data = json.loads(payload_text)
+        assert isinstance(data, dict) and data
+        return data, ""
+    except Exception:
+        return None, "Predictions must be a non-empty JSON object."
+
+
+def _submit_form(task_id: str, key: str,
+                 expected_row_ids: list[str] | None = None) -> None:
     system_id = st.text_input("Your team / model name", "my_model",
                               key=f"system_{key}")
+    uploaded = st.file_uploader(
+        "Upload predictions (.json or .csv with row_id,prediction)",
+        type=["json", "csv"], key=f"file_{key}")
     payload_text = st.text_area(
-        "Your predictions (JSON: row_id → number)", "{}",
+        "…or paste JSON (row_id → number)", "{}",
         key=f"payload_{key}",
         help="Row ids are inside the task you downloaded.")
     if st.button("🚀 Submit", key=f"btn_{key}", type="primary"):
-        try:
-            submission = json.loads(payload_text)
-            assert isinstance(submission, dict) and submission
-        except Exception:
-            st.error("Predictions must be a non-empty JSON object.")
+        submission, error = _parse_submission(uploaded, payload_text)
+        if submission is None:
+            st.error(error)
             return
+        if expected_row_ids:
+            expected = set(expected_row_ids)
+            got = set(submission)
+            missing, extra = sorted(expected - got), sorted(got - expected)
+            if missing or extra:
+                st.error(
+                    "Row ids do not match this task. "
+                    + (f"Missing {len(missing)} (e.g. {missing[:3]}). "
+                       if missing else "")
+                    + (f"Unknown {len(extra)} (e.g. {extra[:3]})."
+                       if extra else ""))
+                return
         stamped = {
             "task_id": task_id,
             "system_id": system_id.strip() or "anonymous",
@@ -236,7 +327,8 @@ def _submit_form(task_id: str, key: str) -> None:
             "submitted_at": datetime.now(timezone.utc).isoformat(),
         }
         _state_put(f"submissions/{task_id}__{stamped['system_id']}.json", stamped)
-        st.success(f"Locked in at {stamped['submitted_at'][:19]} UTC.")
+        checked = " (row ids verified)" if expected_row_ids else ""
+        st.success(f"Locked in at {stamped['submitted_at'][:19]} UTC{checked}.")
         st.balloons()
 
 
@@ -282,6 +374,13 @@ def _request_section(kind: str) -> None:
             difficulty = st.select_slider(
                 "How hard should it be?", ["easy", "medium", "hard"],
                 value="medium", key=f"reqdiff_{kind}")
+            api_key = st.text_input(
+                "Your DeepSeek API key (optional)", type="password",
+                key=f"reqkey_{kind}",
+                help="Without a key you draw from a small shared daily "
+                     "quota. Your key is used once for this generation and "
+                     "deleted immediately after — prefer a spending-capped "
+                     "key.")
             with st.expander("Optional: pin down specifics"):
                 assets_text = st.text_input(
                     "Assets (comma-separated tickers)", "",
@@ -311,6 +410,7 @@ def _request_section(kind: str) -> None:
                     "kind": kind,
                     "request_text": request_text.strip(),
                     "difficulty": difficulty,
+                    **({"api_key": api_key.strip()} if api_key.strip() else {}),
                     "assets": [a.strip().upper()
                                for a in assets_text.split(",") if a.strip()],
                     "status": "pending",
@@ -354,6 +454,11 @@ def _request_status_list(kind: str) -> None:
             if request.get("measured_difficulty") is not None:
                 pills.append(
                     (f"measured: {request['measured_difficulty']:.2f}", "teal"))
+            if request.get("payer"):
+                pills.append(("💳 your key" if request["payer"] == "guest_key"
+                              else "🎁 shared quota", "slate"))
+            if request.get("llm_cost_usd") is not None:
+                pills.append((f"${request['llm_cost_usd']:.4f}", "slate"))
             st.markdown(
                 f'<div class="vf-title">'
                 f'{_pretty(str(request.get("task_id") or "")) or "…"}</div>'
@@ -404,7 +509,8 @@ def detail_live(task_id: str) -> None:
     st.caption(f"{task_id} · deadline {row.get('resolve_after')} UTC")
     if is_open:
         st.subheader("📤 Submit your prediction")
-        _submit_form(task_id, f"live_{task_id}")
+        _submit_form(task_id, f"live_{task_id}",
+                     expected_row_ids=row.get("row_ids") or None)
     else:
         st.info("This task has resolved — submissions are closed.")
     st.subheader("🏅 Scores on this task")
@@ -424,6 +530,7 @@ def detail_bundle(task_id: str, *, challenge: bool) -> None:
     st.title(_pretty(task_id, manifest))
     baselines = manifest.get("baselines") or {}
     pills = [
+        _lifecycle_pill(task_id) if challenge else ("🧪 practice", "slate"),
         ("🎯 challenge" if challenge else "🧪 practice",
          "indigo" if challenge else "slate"),
         (str(manifest.get("family", "?")).replace("_", " "), "teal"),
@@ -446,17 +553,27 @@ def detail_bundle(task_id: str, *, challenge: bool) -> None:
                               " Answers are included: score yourself locally."))
     if challenge:
         st.subheader("📤 Submit your prediction")
-        _submit_form(task_id, f"hist_{task_id}")
+        _submit_form(task_id, f"hist_{task_id}",
+                     expected_row_ids=_dataset_row_ids(prefix, task_id))
         st.subheader("🏅 Scores on this task")
         try:
             _task_scores(_score_rows("historical_scores"), task_id)
         except Exception as exc:
             st.error(f"scores unavailable: {exc}")
-        st.subheader("💬 Feedback on this task")
-        st.caption("Goes into task memory: it steers this task's revision "
-                   "and future generation.")
-        _feedback_form(f"task_{task_id}", f"task_{task_id}",
-                       "Anything wrong or confusing about this task?")
+        lifecycle = _task_lifecycle().get(task_id, "approved")
+        if lifecycle in ("pending review", "improving"):
+            st.subheader("💬 Feedback on this task")
+            st.caption("This task is still under review — feedback here "
+                       "drives its regeneration.")
+            _feedback_form(f"task_{task_id}", f"task_{task_id}",
+                           "Anything wrong or confusing about this task?")
+        else:
+            with st.expander("🚩 Report an issue with this task"):
+                st.caption("Found a data problem, leak, or scoring bug after "
+                           "solving it? This is the highest-value feedback "
+                           "there is — it goes straight into task memory.")
+                _feedback_form(f"task_{task_id}", f"task_{task_id}",
+                               "What did you find?")
 
 
 # ---------- list pages ----------
@@ -514,6 +631,7 @@ def page_historical() -> None:
         except Exception:
             manifest = {}
         _task_row(task_id, _pretty(task_id, manifest), [
+            _lifecycle_pill(task_id),
             (str(manifest.get("family", "challenge")).replace("_", " "), "teal"),
             *[(a, "slate") for a in (manifest.get("assets") or [])[:6]],
             ("answers withheld", "indigo"),
