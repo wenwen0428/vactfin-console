@@ -475,9 +475,13 @@ def _request_section(kind: str) -> None:
                     pair_style = st.radio(
                         "Task style", ["clean", "clean + leaky pair"],
                         key=f"reqpair_{kind}", horizontal=True,
-                        help="A pair adds a twin with one planted leak: "
-                             "submit to both and your score gap measures "
-                             "how much the leak inflates you.")
+                        help="A pair publishes BOTH arms under the mode "
+                             "you chose above. In competition, submit to "
+                             "both tasks — your own score gap IS your "
+                             "inflation, measured on you. The leaky twin "
+                             "declares itself in its manifest and ranks on "
+                             "its own board; it never pollutes the clean "
+                             "leaderboard.")
                     pair_operator = st.selectbox(
                         "Leak type (pair only)", list(OPERATORS),
                         key=f"reqop_{kind}",
