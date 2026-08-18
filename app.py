@@ -394,6 +394,20 @@ def _feedback_form(scope: str, key: str, hint: str) -> None:
 
 # ---------- requests (embedded per page) ----------
 
+def _chart_render_estimate(assets_text: str, pinned: bool,
+                           win_start, win_end) -> int:
+    """Browser-side preview of the builder's assets x months render cap.
+
+    The builder enforces the real cap fail-closed at generation time; this
+    estimate exists so an oversized request is refused before it is sent,
+    not hours later in a failure status. Unpinned windows use the default
+    generation period (~30 months) as the estimate.
+    """
+    n_assets = max(1, len([a for a in assets_text.split(",") if a.strip()]))
+    months = (max(1, (win_end - win_start).days // 30) if pinned else 30)
+    return n_assets * months
+
+
 def _request_section(kind: str) -> None:
     label = ("✨ Request a new live challenge" if kind == "live"
              else "✨ Request a new historical challenge")
@@ -471,24 +485,25 @@ def _request_section(kind: str) -> None:
                                               f"{OPERATORS[o]}")
                     pin_window = st.checkbox(
                         "Pin the data window", key=f"reqwin_{kind}",
-                        help="Unchecked = we pick the period (this is one of "
-                             "the knobs our curriculum learns). Checked = "
-                             "your dates are honored as a hard constraint.")
-                    if pin_window:
-                        w1, w2 = st.columns(2)
-                        win_start = w1.date_input(
-                            "From", date(2024, 1, 2),
-                            min_value=date(2021, 1, 4),
-                            max_value=date.today(),
-                            key=f"reqws_{kind}")
-                        win_end = w2.date_input(
-                            "To", date.today(),
-                            min_value=date(2021, 1, 4),
-                            max_value=date.today(),
-                            key=f"reqwe_{kind}")
-                        st.caption("Train/test split lands inside this "
-                                   "window; the tail auto-reserves room for "
-                                   "the horizon's labels.")
+                        help="Unchecked = we pick the period (one of the "
+                             "knobs our curriculum learns) and the dates "
+                             "below are ignored. Checked = your dates are "
+                             "honored as a hard constraint.")
+                    w1, w2 = st.columns(2)
+                    win_start = w1.date_input(
+                        "From", date(2024, 1, 2),
+                        min_value=date(2021, 1, 4),
+                        max_value=date.today(),
+                        key=f"reqws_{kind}")
+                    win_end = w2.date_input(
+                        "To", date.today(),
+                        min_value=date(2021, 1, 4),
+                        max_value=date.today(),
+                        key=f"reqwe_{kind}")
+                    st.caption("Any start from 2021-01-04 on; the window "
+                               "must span at least ~6 months so there is "
+                               "enough data to train, split, and label. "
+                               "Used only when pinned.")
                 else:
                     rounds = 1
                     if live_shape in ("chain", "portfolio"):
@@ -526,6 +541,18 @@ def _request_section(kind: str) -> None:
             elif not api_key.strip():
                 st.error("Please add your DeepSeek API key — generation "
                          "runs on your own quota.")
+            elif (kind == "historical" and pin_window
+                  and (win_end - win_start).days < 180):
+                st.error("A pinned window needs at least 180 calendar days "
+                         "(≈6 months): room for lookback, a purged "
+                         "train/test split, and forward labels.")
+            elif (kind == "historical" and "chart" in (modalities or [])
+                  and _chart_render_estimate(
+                      assets_text, pin_window, win_start, win_end) > 500):
+                st.error("Chart evidence would need too many rendered "
+                         "images for this window × asset count (cap 500 — "
+                         "one chart per asset per month). Narrow the "
+                         "window, list fewer assets, or drop charts.")
             else:
                 stamp = datetime.now(timezone.utc).isoformat()
                 payload = {
