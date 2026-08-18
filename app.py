@@ -14,7 +14,7 @@ import json
 import os
 import re
 import zipfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import requests
 import streamlit as st
@@ -469,6 +469,26 @@ def _request_section(kind: str) -> None:
                         key=f"reqop_{kind}",
                         format_func=lambda o: f"{o.replace('_', ' ')} — "
                                               f"{OPERATORS[o]}")
+                    pin_window = st.checkbox(
+                        "Pin the data window", key=f"reqwin_{kind}",
+                        help="Unchecked = we pick the period (this is one of "
+                             "the knobs our curriculum learns). Checked = "
+                             "your dates are honored as a hard constraint.")
+                    if pin_window:
+                        w1, w2 = st.columns(2)
+                        win_start = w1.date_input(
+                            "From", date(2024, 1, 2),
+                            min_value=date(2021, 1, 4),
+                            max_value=date.today(),
+                            key=f"reqws_{kind}")
+                        win_end = w2.date_input(
+                            "To", date.today(),
+                            min_value=date(2021, 1, 4),
+                            max_value=date.today(),
+                            key=f"reqwe_{kind}")
+                        st.caption("Train/test split lands inside this "
+                                   "window; the tail auto-reserves room for "
+                                   "the horizon's labels.")
                 else:
                     rounds = 1
                     if live_shape in ("chain", "portfolio"):
@@ -526,6 +546,9 @@ def _request_section(kind: str) -> None:
                         payload["modalities"] = modalities
                     if pair_style == "clean + leaky pair":
                         payload["pair_operator"] = pair_operator
+                    if pin_window:
+                        payload["date_start"] = win_start.isoformat()
+                        payload["date_end"] = win_end.isoformat()
                     payload["mode"] = mode
                 else:
                     payload["live_shape"] = live_shape
