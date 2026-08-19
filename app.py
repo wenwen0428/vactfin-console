@@ -527,11 +527,20 @@ def _request_section(kind: str) -> None:
                             key=f"reqhs_{kind}",
                             help="How far ahead you are predicting; also "
                                  "the submission deadline.")
-                    live_evidence = st.multiselect(
-                        "Evidence", ["charts", "news", "filings"],
-                        default=["charts"], key=f"reqev_{kind}",
-                        help="What the solver sees besides the quote: tick "
-                             "charts, fresh headlines, recent SEC filings.")
+                    if live_shape == "polymarket":
+                        live_evidence = []
+                        st.caption("Evidence for prediction-market episodes "
+                                   "is automatic: real YES/NO odds series, "
+                                   "odds charts, and order-book depth — "
+                                   "news/filings do not apply to these "
+                                   "markets.")
+                    else:
+                        live_evidence = st.multiselect(
+                            "Evidence", ["charts", "news", "filings"],
+                            default=["charts"], key=f"reqev_{kind}",
+                            help="What the solver sees besides the quote: "
+                                 "tick charts, fresh headlines, recent SEC "
+                                 "filings.")
             submitted = st.form_submit_button("📨 Send request",
                                               type="primary")
         if submitted:
