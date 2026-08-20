@@ -857,9 +857,6 @@ def _request_status_list(kind: str) -> None:
     recent = _request_rows(kind)
     if not recent:
         return
-
-
-def _request_status_list(kind: str) -> None:
     st.markdown("**Request history**")
     tone = {"pending": ("⏳ pending", "slate"),
             "warming_feed": ("📡 warming feed", "amber"),
