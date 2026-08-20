@@ -579,6 +579,13 @@ def _request_section(kind: str) -> None:
                              "questions (e.g. 'fed, election'). Blank = "
                              "the most liquid markets. Tickers don't apply "
                              "here — these are event markets, not stocks.")
+                elif kind == "live":
+                    assets_text = st.text_input(
+                        "Assets (comma-separated US-equity tickers)", "",
+                        key=f"reqassets_{kind}",
+                        help="Any valid US-equity symbol is accepted into the "
+                             "feed warm-up queue. The task starts only after "
+                             "the collector has fresh coverage for every symbol.")
                 else:
                     assets_text = st.text_input(
                         "Assets (comma-separated tickers)", "",
@@ -703,6 +710,9 @@ def _request_section(kind: str) -> None:
             elif not api_key.strip():
                 st.error("Please add your DeepSeek API key — generation "
                          "runs on your own quota.")
+            elif (kind == "live" and live_shape != "polymarket"
+                  and not assets_text.strip()):
+                st.error("Choose at least one US-equity ticker for a live task.")
             elif (kind == "historical" and pin_window
                   and (win_end - win_start).days < 180):
                 st.error("A pinned window needs at least 180 calendar days "
@@ -770,6 +780,7 @@ def _request_status_list(kind: str) -> None:
         return
     st.markdown("**Your requests**")
     tone = {"pending": ("⏳ pending", "slate"),
+            "warming_feed": ("📡 warming feed", "amber"),
             "awaiting_review": ("👀 review me", "amber"),
             "changes_requested": ("🔁 regenerating", "amber"),
             "fulfilled": ("✅ ready", "teal"),
@@ -809,6 +820,15 @@ def _request_status_list(kind: str) -> None:
                 + _pills(pills), unsafe_allow_html=True)
             if request.get("reason"):
                 st.caption(f"reason: {request['reason']}")
+            admission = request.get("stream_admission") or {}
+            if admission:
+                requested = admission.get("requested_lookback_seconds")
+                available = admission.get("available_lookback_seconds")
+                st.caption(
+                    "Stream evidence: requested "
+                    f"{_duration_label(requested) if requested else 'all buffered'}; "
+                    f"available {_duration_label(available)}; "
+                    f"minimum warm-up {_duration_label(admission.get('minimum_warmup_seconds'))}.")
             if request.get("status") == "awaiting_review":
                 st.write("The task is generated — open it above, then decide:")
                 approve_col, change_col = st.columns(2)
