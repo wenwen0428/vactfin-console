@@ -521,6 +521,13 @@ def _request_section(kind: str) -> None:
                             key=f"reqhs_{kind}",
                             help="Real time between rounds; also each "
                                  "round's horizon.")
+                    elif live_shape == "polymarket":
+                        horizon_seconds = 3600
+                        st.caption("A prediction-market episode is organised "
+                                   "per market: one allocation per selected "
+                                   "market, marked to the observed odds "
+                                   "path. Multi-step rebalancing is on the "
+                                   "roadmap.")
                     else:
                         horizon_seconds = st.number_input(
                             "Horizon (seconds)", 60, 604_800, 3600,
