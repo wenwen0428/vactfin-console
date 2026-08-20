@@ -20,6 +20,7 @@ import requests
 import streamlit as st
 
 BUCKET = os.environ.get("VACTFIN_BUCKET", "vactfin-artifacts")
+DAILY_SUBMISSION_CAP = 3  # per task, per team, per UTC day
 STATE_PREFIX = "state"
 FAMILIES = ["return_forecasting", "volatility_forecasting",
             "cross_sectional_ranking", "portfolio_trading"]
@@ -37,10 +38,13 @@ LIVE_SHAPES = {
               "A fresh round every interval — submit before each round's "
               "deadline; rounds average into your score."),
     "portfolio": ("Portfolio paper-trading",
-                  "Allocate a paper portfolio over recent real ticks."),
+                  "Submit signed allocation signals over a strict live stream."),
     "polymarket": ("Prediction-market paper-trading",
-                   "Paper-trade real Polymarket YES/NO markets."),
+                   "Submit YES exposure signals over a strict live Polymarket "
+                   "odds stream."),
 }
+LIVE_MIN_INTERVAL_MINUTES = 5
+LIVE_RECOMMENDED_INTERVAL_MINUTES = (15, 60)
 
 CSS = """
 <style>
@@ -284,6 +288,93 @@ def _time_left(resolve_after: str) -> str:
     return f"{seconds // 86400}d {(seconds % 86400) // 3600}h left"
 
 
+def _duration_label(seconds: object) -> str:
+    try:
+        value = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "unknown"
+    if value < 60:
+        return f"{value}s"
+    if value < 3600:
+        return f"{value // 60}m"
+    if value < 86_400:
+        return f"{value // 3600}h {(value % 3600) // 60}m"
+    return f"{value // 86_400}d {(value % 86_400) // 3600}h"
+
+
+def _age_label(timestamp: object) -> str:
+    try:
+        observed = datetime.fromisoformat(str(timestamp))
+    except ValueError:
+        return "unknown"
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    return f"{_duration_label((datetime.now(timezone.utc) - observed).total_seconds())} ago"
+
+
+@st.cache_data(ttl=30)
+def _feed_health_rows() -> list[dict]:
+    try:
+        names = _state_list("feed_health")
+    except Exception:
+        return []
+    rows = []
+    for name in names:
+        try:
+            rows.append(_state_get(f"feed_health/{name}"))
+        except Exception:
+            continue
+    return sorted(rows, key=lambda row: str(row.get("mirrored_at", "")),
+                  reverse=True)
+
+
+def _feed_health_panel() -> None:
+    rows = _feed_health_rows()
+    with st.expander("Live feed health", expanded=not rows):
+        if not rows:
+            st.warning("No feed heartbeat has been mirrored yet. Requests are "
+                       "still validated by the generator, but this page cannot "
+                       "show current coverage until the operator publishes it.")
+            return
+        for row in rows:
+            status = row.get("status") or {}
+            coverage = status.get("coverage") or {}
+            window = coverage.get("common_buffer_window") or {}
+            is_healthy = coverage.get("status") == "pass"
+            columns = st.columns(4)
+            columns[0].metric(str(row.get("feed_id", "feed")),
+                              "healthy" if is_healthy else "attention")
+            columns[1].metric("Available look-back",
+                              _duration_label(window.get("seconds")))
+            columns[2].metric("Fresh ticks", coverage.get("ticks_total", 0))
+            columns[3].metric("Mirrored", _age_label(row.get("mirrored_at")))
+            if not is_healthy:
+                missing = coverage.get("missing_assets") or []
+                stale = coverage.get("stale_assets") or []
+                detail = ", ".join([*missing, *stale]) or "coverage check failed"
+                st.caption(f"Not ready: {detail}")
+            if window.get("start") and window.get("end"):
+                st.caption("Buffered evidence: "
+                           f"{window['start']} to {window['end']} UTC. "
+                           "A request for a longer look-back uses only this "
+                           "available window and records that fact in its manifest.")
+
+
+def _live_task_pills(row: dict) -> list[tuple[str, str]]:
+    family = str(row.get("family") or "live task").replace("_", " ")
+    lookback = (row.get("evidence_lookback") or {}).get("lookback_seconds")
+    resolution = row.get("stream_resolution") or {}
+    pills = [(family, "indigo"),
+             (str(row.get("prediction_target") or "forecast").replace("_", " "),
+              "teal")]
+    if lookback is not None:
+        pills.append((f"look-back {_duration_label(lookback)}", "slate"))
+    if resolution:
+        pills.append(("strict stream" if resolution.get("strict") else "stream",
+                      "teal" if resolution.get("strict") else "amber"))
+    return pills
+
+
 def _open_task(kind: str, task_id: str) -> None:
     st.session_state["view"] = {"kind": kind, "task_id": task_id}
     st.rerun()
@@ -303,9 +394,15 @@ def _task_row(task_id: str, title: str, pills: list[tuple[str, str]],
 
 
 def _parse_submission(uploaded, payload_text: str) -> tuple[dict | None, str]:
-    """Uploaded .json/.csv wins over the pasted text. Returns (data, error)."""
+    """Uploaded .json/.csv/.py wins over the pasted text. Returns (data, error)."""
     if uploaded is not None:
         raw = uploaded.getvalue().decode("utf-8", errors="replace")
+        if uploaded.name.lower().endswith(".py"):
+            if "def predict" not in raw:
+                return None, ("predict.py must define "
+                              "`def predict(train, test)` — see the task's "
+                              "instruction.md for the exact contract.")
+            return {"kind": "code", "code": raw}, ""
         if uploaded.name.lower().endswith(".csv"):
             rows = [line.split(",") for line in raw.strip().splitlines()
                     if line.strip()]
@@ -335,8 +432,10 @@ def _submit_form(task_id: str, key: str,
     system_id = st.text_input("Your team / model name", "my_model",
                               key=f"system_{key}")
     uploaded = st.file_uploader(
-        "Upload predictions (.json or .csv with row_id,prediction)",
-        type=["json", "csv"], key=f"file_{key}")
+        "Upload predictions (.json / .csv with row_id,prediction) or a "
+        "predict.py (scored by running your code in our sandbox — contract "
+        "in the task's instruction.md)",
+        type=["json", "csv", "py"], key=f"file_{key}")
     payload_text = st.text_area(
         "…or paste JSON (row_id → number)", "{}",
         key=f"payload_{key}",
@@ -346,7 +445,8 @@ def _submit_form(task_id: str, key: str,
         if submission is None:
             st.error(error)
             return
-        if expected_row_ids:
+        is_code = submission.get("kind") == "code"
+        if expected_row_ids and not is_code:
             expected = set(expected_row_ids)
             got = set(submission)
             missing, extra = sorted(expected - got), sorted(got - expected)
@@ -358,13 +458,29 @@ def _submit_form(task_id: str, key: str,
                     + (f"Unknown {len(extra)} (e.g. {extra[:3]})."
                        if extra else ""))
                 return
+        sid = system_id.strip() or "anonymous"
+        today = datetime.now(timezone.utc).date().isoformat()
+        try:
+            previous = _state_get(f"submissions/{task_id}__{sid}.json")
+        except Exception:
+            previous = {}
+        used = (int(previous.get("submissions_today") or 0)
+                if str(previous.get("submitted_at", "")).startswith(today)
+                else 0)
+        if used >= DAILY_SUBMISSION_CAP:
+            st.error(f"Daily limit reached: {DAILY_SUBMISSION_CAP} "
+                     "submissions per task per team per UTC day. This keeps "
+                     "the leaderboard a measure of your model, not of "
+                     "hill-climbing on the metric. Try again tomorrow.")
+            return
         stamped = {
             "task_id": task_id,
-            "system_id": system_id.strip() or "anonymous",
+            "system_id": sid,
             "submission": submission,
             "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "submissions_today": used + 1,
         }
-        _state_put(f"submissions/{task_id}__{stamped['system_id']}.json", stamped)
+        _state_put(f"submissions/{task_id}__{sid}.json", stamped)
         checked = " (row ids verified)" if expected_row_ids else ""
         st.success(f"Locked in at {stamped['submitted_at'][:19]} UTC{checked}.")
         st.balloons()
@@ -454,9 +570,19 @@ def _request_section(kind: str) -> None:
                      "machine, and deleted the moment your request is "
                      "handled. Prefer a spending-capped key.")
             with st.expander("Optional: pin down specifics"):
-                assets_text = st.text_input(
-                    "Assets (comma-separated tickers)", "",
-                    key=f"reqassets_{kind}")
+                if kind == "live" and live_shape == "polymarket":
+                    assets_text = st.text_input(
+                        "Market keywords (comma-separated)", "",
+                        key=f"reqassets_{kind}",
+                        help="Filters which live prediction markets the "
+                             "episode trades, matched against market "
+                             "questions (e.g. 'fed, election'). Blank = "
+                             "the most liquid markets. Tickers don't apply "
+                             "here — these are event markets, not stocks.")
+                else:
+                    assets_text = st.text_input(
+                        "Assets (comma-separated tickers)", "",
+                        key=f"reqassets_{kind}")
                 if kind == "historical":
                     family = st.selectbox(
                         "Task family",
@@ -510,37 +636,53 @@ def _request_section(kind: str) -> None:
                                "Used only when pinned.")
                 else:
                     rounds = 1
-                    if live_shape in ("chain", "portfolio"):
+                    if live_shape in ("chain", "portfolio", "polymarket"):
                         c1, c2 = st.columns(2)
+                        default_interval_minutes = (
+                            15 if live_shape == "polymarket" else 60)
                         rounds = c1.number_input(
                             "Rounds", 2, 10, 3, key=f"reqrounds_{kind}",
                             help="How many prediction rounds the challenge "
                                  "runs for.")
-                        horizon_seconds = c2.number_input(
-                            "Round interval (seconds)", 60, 604_800, 3600,
+                        interval_minutes = c2.number_input(
+                            "Round interval (minutes)", LIVE_MIN_INTERVAL_MINUTES,
+                            10_080, default_interval_minutes,
                             key=f"reqhs_{kind}",
-                            help="Real time between rounds; also each "
-                                 "round's horizon.")
-                    elif live_shape == "polymarket":
-                        horizon_seconds = 3600
-                        st.caption("A prediction-market episode is organised "
-                                   "per market: one allocation per selected "
-                                   "market, marked to the observed odds "
-                                   "path. Multi-step rebalancing is on the "
-                                   "roadmap.")
+                            help="Real time between rounds and each round's "
+                                 f"forecast horizon. {LIVE_RECOMMENDED_INTERVAL_MINUTES[0]}–"
+                                 f"{LIVE_RECOMMENDED_INTERVAL_MINUTES[1]} minutes is recommended.")
+                        horizon_seconds = int(interval_minutes) * 60
                     else:
-                        horizon_seconds = st.number_input(
-                            "Horizon (seconds)", 60, 604_800, 3600,
+                        horizon_minutes = st.number_input(
+                            "Forecast horizon (minutes)", LIVE_MIN_INTERVAL_MINUTES,
+                            10_080, 60,
                             key=f"reqhs_{kind}",
-                            help="How far ahead you are predicting; also "
-                                 "the submission deadline.")
+                            help="How far ahead the single forecast is scored.")
+                        horizon_seconds = int(horizon_minutes) * 60
+                    st.caption(
+                        f"Recommended live round interval: "
+                        f"{LIVE_RECOMMENDED_INTERVAL_MINUTES[0]}–"
+                        f"{LIVE_RECOMMENDED_INTERVAL_MINUTES[1]} minutes. "
+                        "The feed may collect more frequently; collection "
+                        "cadence and scoring interval are separate.")
+                    lookback_minutes = st.number_input(
+                        "Evidence look-back (minutes, 0 = all buffered "
+                        "history)", 0, 43_200, 60, key=f"reqlb_{kind}",
+                        help="Bounds how far back the evidence window "
+                             "reaches: ticks, charts, headlines and "
+                             "filings are restricted to [start − "
+                             "look-back, start]. For multi-round tasks "
+                             "the window slides with each round. 0 "
+                             "keeps the default: everything the buffer "
+                             "holds. If the buffer holds less than you "
+                             "ask for, the effective window is shorter "
+                             "— the task manifest records both.")
                     if live_shape == "polymarket":
-                        live_evidence = []
-                        st.caption("Evidence for prediction-market episodes "
-                                   "is automatic: real YES/NO odds series, "
-                                   "odds charts, and order-book depth — "
-                                   "news/filings do not apply to these "
-                                   "markets.")
+                        live_evidence = ["charts"]
+                        st.caption("Prediction-market evidence is bounded "
+                                   "from the local Polymarket odds stream. "
+                                   "News/filings are not attached to event "
+                                   "markets in this path.")
                     else:
                         live_evidence = st.multiselect(
                             "Evidence", ["charts", "news", "filings"],
@@ -580,8 +722,11 @@ def _request_section(kind: str) -> None:
                     "request_text": request_text.strip(),
                     "difficulty": difficulty,
                     "api_key_sealed": sealed_key,
-                    "assets": [a.strip().upper()
-                               for a in assets_text.split(",") if a.strip()],
+                    "assets": ([] if kind == "live"
+                               and live_shape == "polymarket"
+                               else [a.strip().upper()
+                                     for a in assets_text.split(",")
+                                     if a.strip()]),
                     "status": "pending",
                     "requested_at": stamp,
                 }
@@ -600,8 +745,14 @@ def _request_section(kind: str) -> None:
                 else:
                     payload["live_shape"] = live_shape
                     payload["rounds"] = int(rounds)
+                    if live_shape == "polymarket":
+                        payload["market_keywords"] = [
+                            a.strip() for a in assets_text.split(",")
+                            if a.strip()]
                     payload["horizon_seconds"] = int(horizon_seconds)
                     payload["evidence"] = live_evidence
+                    if lookback_minutes:
+                        payload["lookback_seconds"] = int(lookback_minutes) * 60
                 _state_put(f"requests/req_{stamp.replace(':', '-')}.json",
                            payload)
                 st.success("Request received! Track it below.")
@@ -639,6 +790,17 @@ def _request_status_list(kind: str) -> None:
                               else "🎁 shared quota", "slate"))
             if request.get("llm_cost_usd") is not None:
                 pills.append((f"${request['llm_cost_usd']:.4f}", "slate"))
+            if request.get("kind") == "live":
+                shape = str(request.get("live_shape") or "single").replace("_", " ")
+                pills.append((shape, "indigo"))
+                rounds = request.get("rounds")
+                horizon = request.get("horizon_seconds")
+                if rounds and horizon:
+                    pills.append((f"{rounds} rounds · {_duration_label(horizon)}",
+                                  "slate"))
+                if request.get("lookback_seconds"):
+                    pills.append((f"look-back {_duration_label(request['lookback_seconds'])}",
+                                  "slate"))
             st.markdown(
                 f'<div class="vf-title">'
                 f'{_pretty(str(request.get("task_id") or "")) or "…"}</div>'
@@ -683,6 +845,7 @@ def detail_live(task_id: str) -> None:
         (f"⏱ {_time_left(str(row.get('resolve_after', '')))}",
          "amber" if is_open else "slate"),
         (f"📊 {row.get('metric_id')}", "indigo"),
+        *_live_task_pills(row),
         *[(a.strip(), "slate")
           for a in str(row.get("assets", "")).split(",") if a.strip()],
     ]), unsafe_allow_html=True)
@@ -762,6 +925,7 @@ def page_live() -> None:
     st.header("🔴 Live challenges")
     st.write("Predict what the market does next — open a task to submit "
              "before its deadline.")
+    _feed_health_panel()
     _request_section("live")
     try:
         rows = _registry_rows()
@@ -782,6 +946,7 @@ def page_live() -> None:
              "teal" if is_open else "slate"),
             (f"⏱ {_time_left(str(row.get('resolve_after', '')))}",
              "amber" if is_open else "slate"),
+            *_live_task_pills(row),
             *[(a.strip(), "slate")
               for a in str(row.get("assets", "")).split(",") if a.strip()],
         ], "live")
