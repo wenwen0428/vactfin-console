@@ -508,7 +508,7 @@ def _feedback_form(scope: str, key: str, hint: str) -> None:
             st.success("Got it — this feeds the next generation cycle. 🙏")
 
 
-# ---------- requests (embedded per page) ----------
+# ---------- task generation ----------
 
 def _chart_render_estimate(assets_text: str, pinned: bool,
                            win_start, win_end) -> int:
@@ -524,15 +524,15 @@ def _chart_render_estimate(assets_text: str, pinned: bool,
     return n_assets * months
 
 
-def _request_section(kind: str) -> None:
-    label = ("✨ Request a new live challenge" if kind == "live"
-             else "✨ Request a new historical challenge")
-    with st.expander(label):
+def _request_section(kind: str, *, expanded: bool = False) -> None:
+    label = ("Configure a live task" if kind == "live"
+             else "Configure a historical task")
+    with st.expander(label, expanded=expanded):
         st.write("Describe what you want in your own words — that "
                  "description drives the generator.")
         if kind == "live":
             live_shape = st.radio(
-                "Challenge shape", list(LIVE_SHAPES),
+                "Task shape", list(LIVE_SHAPES),
                 key=f"reqshape_{kind}", horizontal=True,
                 format_func=lambda v: LIVE_SHAPES[v][0],
                 captions=None)
@@ -649,7 +649,7 @@ def _request_section(kind: str) -> None:
                             15 if live_shape == "polymarket" else 60)
                         rounds = c1.number_input(
                             "Rounds", 2, 10, 3, key=f"reqrounds_{kind}",
-                            help="How many prediction rounds the challenge "
+                            help="How many prediction rounds the task "
                                  "runs for.")
                         interval_minutes = c2.number_input(
                             "Round interval (minutes)", LIVE_MIN_INTERVAL_MINUTES,
@@ -765,20 +765,102 @@ def _request_section(kind: str) -> None:
                         payload["lookback_seconds"] = int(lookback_minutes) * 60
                 _state_put(f"requests/req_{stamp.replace(':', '-')}.json",
                            payload)
-                st.success("Request received! Track it below.")
-        _request_status_list(kind)
+                st.success("Task request received. Track generation on the right.")
+
+
+def _request_rows(kind: str | None = None) -> list[tuple[str, dict]]:
+    try:
+        names = _state_list("requests")[-30:]
+        rows = [(name, _state_get(f"requests/{name}")) for name in names]
+    except Exception:
+        return []
+    if kind is not None:
+        rows = [(name, row) for name, row in rows if row.get("kind") == kind]
+    return sorted(rows, key=lambda row: str(row[1].get("requested_at", "")),
+                  reverse=True)
+
+
+def _generation_stage(request: dict) -> tuple[int, str]:
+    status = str(request.get("status") or "pending")
+    if status == "pending":
+        return 0, "Queued"
+    if status == "warming_feed":
+        return 1, "Warming live evidence"
+    if status in {"generating", "changes_requested"}:
+        return 2, "Planning and building"
+    if status == "awaiting_review":
+        return 3, "Verified, awaiting review"
+    if status == "fulfilled":
+        return 4, "Task ready"
+    return 2, "Stopped"
+
+
+def _generation_activity(kind: str) -> None:
+    rows = _request_rows(kind)
+    if not rows:
+        st.info("No task requests yet.")
+        return
+    for name, request in rows[:8]:
+        stage, label = _generation_stage(request)
+        status = str(request.get("status") or "pending")
+        tone = "rose" if status in {"failed", "rejected"} else (
+            "teal" if stage >= 3 else "amber" if stage else "slate")
+        title = _pretty(str(request.get("task_id") or "")) or "Task request"
+        with st.container(border=True):
+            st.markdown(
+                f'<div class="vf-title">{title}</div>'
+                f'<div class="vf-sub">{str(request.get("request_text", ""))[:110]}</div>'
+                + _pills([(label, tone), ("live" if kind == "live" else "historical", "indigo")]),
+                unsafe_allow_html=True,
+            )
+            steps = ["Request", "Evidence", "Build", "Verify", "Ready"]
+            progress = " · ".join(
+                f"{'●' if index <= stage else '○'} {step}"
+                for index, step in enumerate(steps)
+            )
+            st.caption(progress)
+            admission = request.get("stream_admission") or {}
+            if admission:
+                st.caption("Live evidence: " + str(admission.get("reason") or "admitted"))
+            if request.get("reason"):
+                st.caption("Status detail: " + str(request["reason"]))
+            trace = request.get("generation_trace") or []
+            if trace:
+                latest = trace[-1]
+                st.caption(
+                    "Latest event: "
+                    + str(latest.get("stage") or "update")
+                    + (f" — {latest['detail']}" if latest.get("detail") else "")
+                )
+            memory = request.get("memory_update") or {}
+            if memory:
+                st.caption("Memory update: " + str(memory.get("status") or "recorded"))
+
+
+def _memory_panel() -> None:
+    st.subheader("Curriculum memory")
+    st.caption(
+        "The generator reads versioned task and outcome guidance. A request's "
+        "final review or live score is the event that can update its memory path.")
+    rows = _request_rows()
+    updates = [row.get("memory_update") for _, row in rows if row.get("memory_update")]
+    if not updates:
+        st.caption("No mirrored memory update is available for these recent requests yet.")
+        return
+    latest = updates[0]
+    st.markdown(_pills([("latest update", "teal"),
+                       (str(latest.get("status") or "recorded"), "slate")]),
+                unsafe_allow_html=True)
 
 
 def _request_status_list(kind: str) -> None:
-    try:
-        names = _state_list("requests")[-20:]
-        recent = [(name, _state_get(f"requests/{name}")) for name in names]
-    except Exception:
-        return
-    recent = [(n, r) for n, r in recent if r.get("kind") == kind]
+    recent = _request_rows(kind)
     if not recent:
         return
-    st.markdown("**Your requests**")
+
+
+def _request_status_list(kind: str) -> None:
+    st.markdown("**Request history**")
     tone = {"pending": ("⏳ pending", "slate"),
             "warming_feed": ("📡 warming feed", "amber"),
             "awaiting_review": ("👀 review me", "amber"),
@@ -830,7 +912,7 @@ def _request_status_list(kind: str) -> None:
                     f"available {_duration_label(available)}; "
                     f"minimum warm-up {_duration_label(admission.get('minimum_warmup_seconds'))}.")
             if request.get("status") == "awaiting_review":
-                st.write("The task is generated — open it above, then decide:")
+                st.write("The task is generated — review it in Task Bank, then decide:")
                 approve_col, change_col = st.columns(2)
                 if approve_col.button("✅ Approve", key=f"appr_{name}"):
                     request["status"] = "fulfilled"
@@ -894,7 +976,7 @@ def detail_bundle(task_id: str, *, challenge: bool) -> None:
     baselines = manifest.get("baselines") or {}
     pills = [
         _lifecycle_pill(task_id) if challenge else ("🧪 practice", "slate"),
-        ("🎯 challenge" if challenge else "🧪 practice",
+        ("🎯 competition task" if challenge else "🧪 practice task",
          "indigo" if challenge else "slate"),
         (str(manifest.get("family", "?")).replace("_", " "), "teal"),
         *[(a, "slate") for a in (manifest.get("assets") or [])[:8]],
@@ -939,14 +1021,9 @@ def detail_bundle(task_id: str, *, challenge: bool) -> None:
                                "What did you find?")
 
 
-# ---------- list pages ----------
+# ---------- workspace pages ----------
 
-def page_live() -> None:
-    st.header("🔴 Live challenges")
-    st.write("Predict what the market does next — open a task to submit "
-             "before its deadline.")
-    _feed_health_panel()
-    _request_section("live")
+def _live_task_bank() -> None:
     try:
         rows = _registry_rows()
     except Exception as exc:
@@ -971,20 +1048,10 @@ def page_live() -> None:
               for a in str(row.get("assets", "")).split(",") if a.strip()],
         ], "live")
     if not rows:
-        st.info("Nothing live right now — request one above.")
-    st.divider()
-    st.subheader("💬 Shape the next live tasks")
-    st.caption("Goes into task memory and steers upcoming live generation.")
-    _feedback_form("live_feedback", "live_page",
-                   "What should the next live tasks look like? "
-                   "(assets, horizons, data you want)")
+        st.info("No live tasks yet.")
 
 
-def page_historical() -> None:
-    st.header("🎯 Historical challenges")
-    st.write("Open a task to download it, submit predictions, and see its "
-             "scores. We hold the answers.")
-    _request_section("historical")
+def _historical_task_bank() -> None:
     rows = []
     try:
         for task_id in _bundle_ids("public_bundles"):
@@ -1012,7 +1079,40 @@ def page_historical() -> None:
             *[(a, "slate") for a in (manifest.get("assets") or [])[:6]],
         ], kind)
     if not rows:
-        st.info("No tasks yet — request one above.")
+        st.info("No historical tasks yet.")
+
+
+def page_generator() -> None:
+    st.header("Task generator")
+    st.caption("Define a research task, inspect its evidence and generation state, then review the verified bundle in Task Bank.")
+    left, right = st.columns([1.25, 0.95], gap="large")
+    with left:
+        kind = st.radio(
+            "Task timing", ["historical", "live"], horizontal=True,
+            format_func=lambda value: "Historical" if value == "historical" else "Live",
+            key="generator_kind",
+        )
+        if kind == "live":
+            _feed_health_panel()
+        _request_section(kind, expanded=True)
+        st.divider()
+        _request_status_list(kind)
+    with right:
+        st.subheader("Generation activity")
+        st.caption("State reflects the worker-mirrored request record; unavailable stages are not inferred.")
+        _generation_activity(kind)
+        st.divider()
+        _memory_panel()
+
+
+def page_task_bank() -> None:
+    st.header("Task bank")
+    st.caption("Generated tasks remain separate from generation requests. Live tasks settle forward; historical bundles hold evaluation labels server-side.")
+    live, historical = st.tabs(["Live tasks", "Historical tasks"])
+    with live:
+        _live_task_bank()
+    with historical:
+        _historical_task_bank()
 
 
 def page_leaderboard() -> None:
@@ -1020,10 +1120,10 @@ def page_leaderboard() -> None:
     st.caption("Live and historical never mix — different games. Under 5 "
                "rounds is flagged: one lucky round proves nothing.")
     for title, caption, subdir in [
-        ("🔴 Live challenges",
+        ("🔴 Live tasks",
          "Scored the moment each deadline resolves against the market.",
          "scores"),
-        ("🎯 Historical challenges",
+        ("🎯 Historical tasks",
          "Scored server-side against withheld answers.",
          "historical_scores"),
     ]:
@@ -1053,8 +1153,8 @@ def page_feedback() -> None:
 
 
 PAGES = {
-    "🔴 Live challenges": page_live,
-    "🎯 Historical challenges": page_historical,
+    "✦ Task generator": page_generator,
+    "▦ Task bank": page_task_bank,
     "🏆 Leaderboard": page_leaderboard,
     "💬 Feedback": page_feedback,
 }
@@ -1065,12 +1165,11 @@ def main() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
     with st.sidebar:
         st.title("📈 VACT-Fin")
-        st.caption("Market prediction challenges, scored fairly and on time.")
+        st.caption("Verification-aware financial task generation.")
         choice = st.radio("Navigate", list(PAGES), key="nav",
                           label_visibility="collapsed")
         st.divider()
-        st.caption("How it works: request or grab a task → predict → submit "
-                   "before the deadline → see your score.")
+        st.caption("Generate → inspect → solve → submit → learn from outcomes.")
 
     if st.session_state.get("last_nav") != choice:
         st.session_state["last_nav"] = choice
