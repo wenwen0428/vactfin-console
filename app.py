@@ -224,7 +224,7 @@ def _task_lifecycle() -> dict[str, str]:
         task_id = str(request.get("task_id") or "")
         if not task_id:
             continue
-        lifecycle[task_id] = {
+        state = {
             "pending": "generating",
             "changes_requested": "improving",
             "awaiting_review": "pending review",
@@ -232,6 +232,8 @@ def _task_lifecycle() -> dict[str, str]:
             "rejected": "failed",
             "failed": "failed",
         }.get(str(request.get("status")), "approved")
+        for related_id in request.get("task_ids") or [task_id]:
+            lifecycle[str(related_id)] = state
     return lifecycle
 
 
@@ -763,8 +765,9 @@ def _request_section(kind: str, *, expanded: bool = False) -> None:
                     payload["evidence"] = live_evidence
                     if lookback_minutes:
                         payload["lookback_seconds"] = int(lookback_minutes) * 60
-                _state_put(f"requests/req_{stamp.replace(':', '-')}.json",
-                           payload)
+                request_name = f"req_{stamp.replace(':', '-')}.json"
+                _state_put(f"requests/{request_name}", payload)
+                st.session_state[f"active_request_{kind}"] = request_name
                 st.success("Task request received. Track generation on the right.")
 
 
@@ -778,6 +781,20 @@ def _request_rows(kind: str | None = None) -> list[tuple[str, dict]]:
         rows = [(name, row) for name, row in rows if row.get("kind") == kind]
     return sorted(rows, key=lambda row: str(row[1].get("requested_at", "")),
                   reverse=True)
+
+
+def _active_request(kind: str) -> tuple[str, dict] | None:
+    """Prefer this browser's submitted request over an unrelated recent one."""
+    name = st.session_state.get(f"active_request_{kind}")
+    if name:
+        try:
+            request = _state_get(f"requests/{name}")
+            if request.get("kind") == kind:
+                return name, request
+        except Exception:
+            pass
+    rows = _request_rows(kind)
+    return rows[0] if rows else None
 
 
 def _generation_stage(request: dict) -> tuple[int, str]:
@@ -796,137 +813,134 @@ def _generation_stage(request: dict) -> tuple[int, str]:
 
 
 def _generation_activity(kind: str) -> None:
-    rows = _request_rows(kind)
-    if not rows:
+    active = _active_request(kind)
+    if active is None:
         st.info("No task requests yet.")
         return
-    for name, request in rows[:8]:
-        stage, label = _generation_stage(request)
-        status = str(request.get("status") or "pending")
-        tone = "rose" if status in {"failed", "rejected"} else (
-            "teal" if stage >= 3 else "amber" if stage else "slate")
-        title = _pretty(str(request.get("task_id") or "")) or "Task request"
-        with st.container(border=True):
-            st.markdown(
-                f'<div class="vf-title">{title}</div>'
-                f'<div class="vf-sub">{str(request.get("request_text", ""))[:110]}</div>'
-                + _pills([(label, tone), ("live" if kind == "live" else "historical", "indigo")]),
-                unsafe_allow_html=True,
-            )
-            steps = ["Request", "Evidence", "Build", "Verify", "Ready"]
-            progress = " · ".join(
-                f"{'●' if index <= stage else '○'} {step}"
-                for index, step in enumerate(steps)
-            )
-            st.caption(progress)
-            admission = request.get("stream_admission") or {}
-            if admission:
-                st.caption("Live evidence: " + str(admission.get("reason") or "admitted"))
-            if request.get("reason"):
-                st.caption("Status detail: " + str(request["reason"]))
-            trace = request.get("generation_trace") or []
-            if trace:
-                latest = trace[-1]
-                st.caption(
-                    "Latest event: "
-                    + str(latest.get("stage") or "update")
-                    + (f" — {latest['detail']}" if latest.get("detail") else "")
-                )
-            memory = request.get("memory_update") or {}
-            if memory:
-                st.caption("Memory update: " + str(memory.get("status") or "recorded"))
+    name, request = active
+    stage, label = _generation_stage(request)
+    status = str(request.get("status") or "pending")
+    tone = "rose" if status in {"failed", "rejected"} else (
+        "teal" if stage >= 3 else "amber" if stage else "slate")
+    title = _pretty(str(request.get("task_id") or "")) or "Task request"
+    with st.container(border=True):
+        st.markdown(
+            f'<div class="vf-title">{title}</div>'
+            f'<div class="vf-sub">{str(request.get("request_text", ""))[:180]}</div>'
+            + _pills([(label, tone), ("live" if kind == "live" else "historical", "indigo")]),
+            unsafe_allow_html=True,
+        )
+        steps = ["Request", "Evidence", "Build", "Verify", "Ready"]
+        st.caption(" · ".join(
+            f"{'●' if index <= stage else '○'} {step}"
+            for index, step in enumerate(steps)
+        ))
+        admission = request.get("stream_admission") or {}
+        if admission:
+            st.caption("Live evidence: " + str(admission.get("reason") or "admitted"))
+        if request.get("reason"):
+            st.caption("Status detail: " + str(request["reason"]))
+        trace = request.get("generation_trace") or []
+        if trace:
+            with st.expander("Generation state changes", expanded=True):
+                for event in trace:
+                    detail = str(event.get("detail") or "")
+                    st.caption(
+                        f"{str(event.get('at') or '')[:19]} UTC · "
+                        f"{str(event.get('stage') or 'update')}"
+                        + (f" · {detail}" if detail else ""))
+        record = request.get("generation_record") or {}
+        _generation_record_panel(record)
+
+
+def _generation_record_panel(record: dict) -> None:
+    """Render typed plans, never hidden LLM reasoning or raw prompts."""
+    if not record:
+        return
+    with st.expander("Interpreted request and verified plan", expanded=True):
+        intent = record.get("intent") or {}
+        plan = record.get("plan") or {}
+        assets = plan.get("assets") or intent.get("assets") or []
+        family = plan.get("ml_family") or ", ".join(intent.get("ml_families") or [])
+        modalities = plan.get("modalities") or intent.get("modalities") or []
+        metric = (record.get("metric") or {}).get("metric_id") or plan.get("metric_id")
+        if family:
+            st.caption("Task family: " + str(family).replace("_", " "))
+        if assets:
+            st.caption("Assets/markets: " + ", ".join(map(str, assets[:8])))
+        if modalities:
+            st.caption("Evidence contract: " + ", ".join(
+                str(item).replace("_", " ") for item in modalities))
+        if metric:
+            metric_note = " (new verified metric)" if (record.get("metric") or {}).get("synthesized") else ""
+            st.caption("Metric: " + str(metric) + metric_note)
+        if plan.get("start") or plan.get("end"):
+            st.caption(f"Data window: {plan.get('start') or 'auto'} to {plan.get('end') or 'auto'}")
+        if plan.get("horizon_trading_days") or plan.get("horizon_seconds"):
+            horizon = (f"{plan['horizon_trading_days']} trading days"
+                       if plan.get("horizon_trading_days") else
+                       _duration_label(plan.get("horizon_seconds")))
+            st.caption("Horizon: " + horizon)
+        unresolved = plan.get("unresolved") or intent.get("unresolved") or []
+        if unresolved:
+            st.warning("Not mapped to a registered capability: " + ", ".join(map(str, unresolved)))
+        verification = record.get("verification") or {}
+        if verification.get("checks"):
+            failed = verification.get("failed_checks") or []
+            st.caption(f"Verifier checks: {verification['checks']} run"
+                       + (f"; issues: {', '.join(map(str, failed))}" if failed else "; all passed"))
+        revision = record.get("revision") or {}
+        if revision.get("feedback"):
+            st.caption("Review feedback: " + " | ".join(map(str, revision["feedback"])))
+            st.caption(str(revision.get("result") or ""))
+        memory = record.get("memory_influence") or {}
+        changed = memory.get("changed_fields") or []
+        if changed:
+            st.caption("Memory changed this plan: " + ", ".join(map(str, changed)))
 
 
 def _memory_panel() -> None:
     st.subheader("Curriculum memory")
     st.caption(
-        "The generator reads versioned task and outcome guidance. A request's "
-        "final review or live score is the event that can update its memory path.")
+        "Global, versioned outcome memory is separate from the request above. "
+        "It can influence future plans; it never changes a completed task.")
+    try:
+        summary = _state_get("memory_summary.json")
+    except Exception:
+        summary = {}
+    if summary:
+        events = summary.get("event_counts") or {}
+        st.markdown(_pills([
+            (f"{summary.get('events_replayed', 0)} replayed events", "teal"),
+            (f"{summary.get('node_count', 0)} graph nodes", "indigo"),
+            (f"{summary.get('edge_count', 0)} graph edges", "slate"),
+        ]), unsafe_allow_html=True)
+        if summary.get("latest_event_at"):
+            st.caption("Latest outcome: " + str(summary["latest_event_at"]))
+        if events:
+            st.caption("Outcome signals: " + ", ".join(
+                f"{kind} {count}" for kind, count in sorted(events.items())))
+        return
     rows = _request_rows()
-    updates = [row.get("memory_update") for _, row in rows if row.get("memory_update")]
-    if not updates:
-        st.caption("No mirrored memory update is available for these recent requests yet.")
+    records = [row.get("generation_record") or {} for _, row in rows]
+    influenced = [record.get("memory_influence") or {} for record in records]
+    influenced = [item for item in influenced if item]
+    if not influenced:
+        st.caption("No global memory mirror is available yet. Recent request records do not claim a graph update.")
         return
-    latest = updates[0]
-    st.markdown(_pills([("latest update", "teal"),
-                       (str(latest.get("status") or "recorded"), "slate")]),
-                unsafe_allow_html=True)
-
-
-def _request_status_list(kind: str) -> None:
-    recent = _request_rows(kind)
-    if not recent:
-        return
-    st.markdown("**Request history**")
-    tone = {"pending": ("⏳ pending", "slate"),
-            "warming_feed": ("📡 warming feed", "amber"),
-            "awaiting_review": ("👀 review me", "amber"),
-            "changes_requested": ("🔁 regenerating", "amber"),
-            "fulfilled": ("✅ ready", "teal"),
-            "rejected": ("❌ rejected", "rose"),
-            "failed": ("❌ failed", "rose")}
-    for name, request in reversed(recent):
-        label, colour = tone.get(str(request.get("status")),
-                                 (str(request.get("status")), "slate"))
-        with st.container(border=True):
-            pills = [(label, colour)]
-            if request.get("difficulty"):
-                pills.append((f"asked: {request['difficulty']}", "indigo"))
-            if request.get("measured_difficulty") is not None:
-                pills.append(
-                    (f"measured: {request['measured_difficulty']:.2f}", "teal"))
-            if request.get("payer"):
-                pills.append(("💳 your key" if request["payer"] == "guest_key"
-                              else "🎁 shared quota", "slate"))
-            if request.get("llm_cost_usd") is not None:
-                pills.append((f"${request['llm_cost_usd']:.4f}", "slate"))
-            if request.get("kind") == "live":
-                shape = str(request.get("live_shape") or "single").replace("_", " ")
-                pills.append((shape, "indigo"))
-                rounds = request.get("rounds")
-                horizon = request.get("horizon_seconds")
-                if rounds and horizon:
-                    pills.append((f"{rounds} rounds · {_duration_label(horizon)}",
-                                  "slate"))
-                if request.get("lookback_seconds"):
-                    pills.append((f"look-back {_duration_label(request['lookback_seconds'])}",
-                                  "slate"))
-            st.markdown(
-                f'<div class="vf-title">'
-                f'{_pretty(str(request.get("task_id") or "")) or "…"}</div>'
-                f'<div class="vf-sub">'
-                f'{str(request.get("request_text", ""))[:90]}</div>'
-                + _pills(pills), unsafe_allow_html=True)
-            if request.get("reason"):
-                st.caption(f"reason: {request['reason']}")
-            admission = request.get("stream_admission") or {}
-            if admission:
-                requested = admission.get("requested_lookback_seconds")
-                available = admission.get("available_lookback_seconds")
-                st.caption(
-                    "Stream evidence: requested "
-                    f"{_duration_label(requested) if requested else 'all buffered'}; "
-                    f"available {_duration_label(available)}; "
-                    f"minimum warm-up {_duration_label(admission.get('minimum_warmup_seconds'))}.")
-            if request.get("status") == "awaiting_review":
-                st.write("The task is generated — review it in Task Bank, then decide:")
-                approve_col, change_col = st.columns(2)
-                if approve_col.button("✅ Approve", key=f"appr_{name}"):
-                    request["status"] = "fulfilled"
-                    _state_put(f"requests/{name}", request)
-                    st.rerun()
-                change_text = change_col.text_input(
-                    "What should change?", key=f"chg_{name}")
-                if change_col.button("🔁 Request changes",
-                                     key=f"chgbtn_{name}"):
-                    if not change_text.strip():
-                        st.error("Say what should change first.")
-                    else:
-                        request.setdefault("review_feedback", []).append(
-                            change_text.strip())
-                        request["status"] = "changes_requested"
-                        _state_put(f"requests/{name}", request)
-                        st.rerun()
+    changed = sum(bool(item.get("changed_fields")) for item in influenced)
+    packets = [item.get("packet") or {} for item in influenced]
+    latest = packets[0] if packets else {}
+    st.markdown(_pills([
+        (f"{len(influenced)} recent plan reads", "teal"),
+        (f"{changed} changed", "indigo"),
+        ("cold start" if latest.get("cold_start") else "memory available", "slate"),
+    ]), unsafe_allow_html=True)
+    if latest:
+        st.caption(
+            f"Prompt-memory budget: {latest.get('used_chars', 0)}/"
+            f"{latest.get('max_chars', 'unknown')} characters; "
+            f"{latest.get('item_count', 0)} retrieved items.")
 
 
 # ---------- task detail sub-pages ----------
@@ -993,6 +1007,7 @@ def detail_bundle(task_id: str, *, challenge: bool) -> None:
     st.caption("manifest.json lists a sha256 for every file — verify after "
                "download." + ("" if challenge else
                               " Answers are included: score yourself locally."))
+    _bundle_review_controls(task_id)
     if challenge:
         st.subheader("📤 Submit your prediction")
         _submit_form(task_id, f"hist_{task_id}",
@@ -1016,6 +1031,37 @@ def detail_bundle(task_id: str, *, challenge: bool) -> None:
                            "there is — it goes straight into task memory.")
                 _feedback_form(f"task_{task_id}", f"task_{task_id}",
                                "What did you find?")
+
+
+def _bundle_review_controls(task_id: str) -> None:
+    """Keep approval/refinement with the bundle, not in a request-history list."""
+    request_match = next(
+        ((name, request) for name, request in _request_rows("historical")
+         if task_id in {str(item) for item in request.get("task_ids") or [request.get("task_id")]}
+         and request.get("status") == "awaiting_review"),
+        None,
+    )
+    if request_match is None:
+        return
+    name, request = request_match
+    st.subheader("Review generated task")
+    st.caption("This verified competition bundle is not listed as approved until you accept it.")
+    approve_col, change_col = st.columns(2)
+    if approve_col.button("Approve task", key=f"appr_{name}"):
+        request["status"] = "fulfilled"
+        _state_put(f"requests/{name}", request)
+        _task_lifecycle.clear()
+        st.rerun()
+    change_text = change_col.text_input("What should change?", key=f"chg_{name}")
+    if change_col.button("Request changes", key=f"chgbtn_{name}"):
+        if not change_text.strip():
+            st.error("Say what should change first.")
+        else:
+            request.setdefault("review_feedback", []).append(change_text.strip())
+            request["status"] = "changes_requested"
+            _state_put(f"requests/{name}", request)
+            _task_lifecycle.clear()
+            st.rerun()
 
 
 # ---------- workspace pages ----------
@@ -1049,23 +1095,38 @@ def _live_task_bank() -> None:
 
 
 def _historical_task_bank() -> None:
-    rows = []
+    """Show published/requested historical tasks, never arbitrary R2 objects."""
+    rows: list[tuple[str, str, dict]] = []
     try:
-        for task_id in _bundle_ids("public_bundles"):
-            rows.append((task_id, "challenge"))
+        names = _state_list("requests")
     except Exception as exc:
-        st.error(f"Bundle store unavailable: {exc}")
-    try:
-        for task_id in _bundle_ids("bundles"):
-            rows.append((task_id, "practice"))
-    except Exception:
-        pass
-    for task_id, kind in sorted(rows):
+        st.error(f"Task index unavailable: {exc}")
+        return
+    for name in names:
         try:
-            prefix = "public_bundles" if kind == "challenge" else "bundles"
-            manifest = _bundle_manifest(prefix, task_id)
+            request = _state_get(f"requests/{name}")
+            if request.get("kind") != "historical":
+                continue
+            task_ids = [str(item) for item in request.get("task_ids") or []]
+            if not task_ids:
+                task_ids = [str(request.get("task_id") or "")]
+            prefix = str(request.get("public_prefix") or "")
+            if not any(task_ids) or prefix not in {"public_bundles", "bundles"}:
+                continue
         except Exception:
-            manifest = {}
+            continue
+        for task_id in task_ids:
+            if not task_id:
+                continue
+            try:
+                manifest = _bundle_manifest(prefix, task_id)
+            except Exception:
+                continue
+            if manifest.get("task_class") != "pit_historical":
+                continue
+            kind = "challenge" if prefix == "public_bundles" else "practice"
+            rows.append((task_id, kind, manifest))
+    for task_id, kind, manifest in sorted(rows, key=lambda row: row[0], reverse=True):
         mode_pill = (("🏆 competition · answers withheld", "indigo")
                      if kind == "challenge"
                      else ("🧪 practice · answers included", "slate"))
@@ -1092,11 +1153,9 @@ def page_generator() -> None:
         if kind == "live":
             _feed_health_panel()
         _request_section(kind, expanded=True)
-        st.divider()
-        _request_status_list(kind)
     with right:
         st.subheader("Generation activity")
-        st.caption("State reflects the worker-mirrored request record; unavailable stages are not inferred.")
+        st.caption("Only this request is shown. The record is worker-mirrored; unavailable stages are not inferred.")
         _generation_activity(kind)
         st.divider()
         _memory_panel()
@@ -1104,7 +1163,7 @@ def page_generator() -> None:
 
 def page_task_bank() -> None:
     st.header("Task bank")
-    st.caption("Generated tasks remain separate from generation requests. Live tasks settle forward; historical bundles hold evaluation labels server-side.")
+    st.caption("Only generator-requested tasks with verified provenance appear here. Live tasks settle forward; historical bundles hold evaluation labels server-side.")
     live, historical = st.tabs(["Live tasks", "Historical tasks"])
     with live:
         _live_task_bank()
